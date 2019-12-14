@@ -2,20 +2,17 @@ package session
 
 import (
 	"context"
-	"math/rand"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru"
 	bsgetter "github.com/ipfs/go-bitswap/getter"
 	notifications "github.com/ipfs/go-bitswap/notifications"
+	bssd "github.com/ipfs/go-bitswap/sessiondata"
 	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	delay "github.com/ipfs/go-ipfs-delay"
 	logging "github.com/ipfs/go-log"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 	loggables "github.com/libp2p/go-libp2p-loggables"
-
-	bssrs "github.com/ipfs/go-bitswap/sessionrequestsplitter"
 )
 
 const (
@@ -34,28 +31,32 @@ type WantManager interface {
 // requesting more when neccesary.
 type PeerManager interface {
 	FindMorePeers(context.Context, cid.Cid)
-	GetOptimizedPeers() []peer.ID
+	GetOptimizedPeers() []bssd.OptimizedPeer
 	RecordPeerRequests([]peer.ID, []cid.Cid)
-	RecordPeerResponse(peer.ID, cid.Cid)
+	RecordPeerResponse(peer.ID, []cid.Cid)
+	RecordCancels([]cid.Cid)
 }
 
 // RequestSplitter provides an interface for splitting
 // a request for Cids up among peers.
 type RequestSplitter interface {
-	SplitRequest([]peer.ID, []cid.Cid) []*bssrs.PartialRequest
+	SplitRequest([]bssd.OptimizedPeer, []cid.Cid) []bssd.PartialRequest
 	RecordDuplicateBlock()
 	RecordUniqueBlock()
 }
 
-type interestReq struct {
-	c    cid.Cid
-	resp chan bool
-}
+type opType int
 
-type blkRecv struct {
-	from           peer.ID
-	blk            blocks.Block
-	counterMessage bool
+const (
+	opReceive opType = iota
+	opWant
+	opCancel
+)
+
+type op struct {
+	op   opType
+	from peer.ID
+	keys []cid.Cid
 }
 
 // Session holds state for an individual bitswap transfer operation.
@@ -68,19 +69,14 @@ type Session struct {
 	pm  PeerManager
 	srs RequestSplitter
 
+	sw sessionWants
+
 	// channels
-	incoming      chan blkRecv
-	newReqs       chan []cid.Cid
-	cancelKeys    chan []cid.Cid
-	interestReqs  chan interestReq
+	incoming      chan op
 	latencyReqs   chan chan time.Duration
 	tickDelayReqs chan time.Duration
 
 	// do not touch outside run loop
-	tofetch             *cidQueue
-	interest            *lru.Cache
-	pastWants           *cidQueue
-	liveWants           map[cid.Cid]time.Time
 	idleTick            *time.Timer
 	periodicSearchTimer *time.Timer
 	baseTickDelay       time.Duration
@@ -102,23 +98,23 @@ func New(ctx context.Context,
 	wm WantManager,
 	pm PeerManager,
 	srs RequestSplitter,
+	notif notifications.PubSub,
 	initialSearchDelay time.Duration,
 	periodicSearchDelay delay.D) *Session {
 	s := &Session{
-		liveWants:           make(map[cid.Cid]time.Time),
-		newReqs:             make(chan []cid.Cid),
-		cancelKeys:          make(chan []cid.Cid),
-		tofetch:             newCidQueue(),
-		pastWants:           newCidQueue(),
-		interestReqs:        make(chan interestReq),
+		sw: sessionWants{
+			toFetch:   newCidQueue(),
+			liveWants: make(map[cid.Cid]time.Time),
+			pastWants: cid.NewSet(),
+		},
 		latencyReqs:         make(chan chan time.Duration),
 		tickDelayReqs:       make(chan time.Duration),
 		ctx:                 ctx,
 		wm:                  wm,
 		pm:                  pm,
 		srs:                 srs,
-		incoming:            make(chan blkRecv),
-		notif:               notifications.New(),
+		incoming:            make(chan op, 16),
+		notif:               notif,
 		uuid:                loggables.Uuid("GetBlockRequest"),
 		baseTickDelay:       time.Millisecond * 500,
 		id:                  id,
@@ -126,62 +122,27 @@ func New(ctx context.Context,
 		periodicSearchDelay: periodicSearchDelay,
 	}
 
-	cache, _ := lru.New(2048)
-	s.interest = cache
-
 	go s.run(ctx)
 
 	return s
 }
 
-// ReceiveBlockFrom receives an incoming block from the given peer.
-func (s *Session) ReceiveBlockFrom(from peer.ID, blk blocks.Block) {
-	select {
-	case s.incoming <- blkRecv{from: from, blk: blk, counterMessage: false}:
-	case <-s.ctx.Done():
+// ReceiveFrom receives incoming blocks from the given peer.
+func (s *Session) ReceiveFrom(from peer.ID, ks []cid.Cid) {
+	interested := s.sw.FilterInteresting(ks)
+	if len(interested) == 0 {
+		return
 	}
-	ks := []cid.Cid{blk.Cid()}
-	s.wm.CancelWants(s.ctx, ks, nil, s.id)
 
-}
-
-// UpdateReceiveCounters updates receive counters for a block,
-// which may be a duplicate and adjusts the split factor based on that.
-func (s *Session) UpdateReceiveCounters(blk blocks.Block) {
 	select {
-	case s.incoming <- blkRecv{from: "", blk: blk, counterMessage: true}:
+	case s.incoming <- op{op: opReceive, from: from, keys: interested}:
 	case <-s.ctx.Done():
 	}
 }
 
-// InterestedIn returns true if this session is interested in the given Cid.
-func (s *Session) InterestedIn(c cid.Cid) bool {
-	if s.interest.Contains(c) {
-		return true
-	}
-	// TODO: PERF: this is using a channel to guard a map access against race
-	// conditions. This is definitely much slower than a mutex, though its unclear
-	// if it will actually induce any noticeable slowness. This is implemented this
-	// way to avoid adding a more complex set of mutexes around the liveWants map.
-	// note that in the average case (where this session *is* interested in the
-	// block we received) this function will not be called, as the cid will likely
-	// still be in the interest cache.
-	resp := make(chan bool, 1)
-	select {
-	case s.interestReqs <- interestReq{
-		c:    c,
-		resp: resp,
-	}:
-	case <-s.ctx.Done():
-		return false
-	}
-
-	select {
-	case want := <-resp:
-		return want
-	case <-s.ctx.Done():
-		return false
-	}
+// IsWanted returns true if this session is waiting to receive the given Cid.
+func (s *Session) IsWanted(c cid.Cid) bool {
+	return s.sw.IsWanted(c)
 }
 
 // GetBlock fetches a single block.
@@ -194,17 +155,18 @@ func (s *Session) GetBlock(parent context.Context, k cid.Cid) (blocks.Block, err
 // guaranteed on the returned blocks.
 func (s *Session) GetBlocks(ctx context.Context, keys []cid.Cid) (<-chan blocks.Block, error) {
 	ctx = logging.ContextWithLoggable(ctx, s.uuid)
-	return bsgetter.AsyncGetBlocks(ctx, keys, s.notif,
+
+	return bsgetter.AsyncGetBlocks(ctx, s.ctx, keys, s.notif,
 		func(ctx context.Context, keys []cid.Cid) {
 			select {
-			case s.newReqs <- keys:
+			case s.incoming <- op{op: opWant, keys: keys}:
 			case <-ctx.Done():
 			case <-s.ctx.Done():
 			}
 		},
 		func(keys []cid.Cid) {
 			select {
-			case s.cancelKeys <- keys:
+			case s.incoming <- op{op: opCancel, keys: keys}:
 			case <-s.ctx.Done():
 			}
 		},
@@ -243,22 +205,21 @@ func (s *Session) run(ctx context.Context) {
 	s.periodicSearchTimer = time.NewTimer(s.periodicSearchDelay.NextWaitTime())
 	for {
 		select {
-		case blk := <-s.incoming:
-			if blk.counterMessage {
-				s.updateReceiveCounters(ctx, blk)
-			} else {
-				s.handleIncomingBlock(ctx, blk)
+		case oper := <-s.incoming:
+			switch oper.op {
+			case opReceive:
+				s.handleReceive(ctx, oper.from, oper.keys)
+			case opWant:
+				s.wantBlocks(ctx, oper.keys)
+			case opCancel:
+				s.sw.CancelPending(oper.keys)
+			default:
+				panic("unhandled operation")
 			}
-		case keys := <-s.newReqs:
-			s.handleNewRequest(ctx, keys)
-		case keys := <-s.cancelKeys:
-			s.handleCancel(keys)
 		case <-s.idleTick.C:
 			s.handleIdleTick(ctx)
 		case <-s.periodicSearchTimer.C:
 			s.handlePeriodicSearch(ctx)
-		case lwchk := <-s.interestReqs:
-			lwchk.resp <- s.cidIsWanted(lwchk.c)
 		case resp := <-s.latencyReqs:
 			resp <- s.averageLatency()
 		case baseTickDelay := <-s.tickDelayReqs:
@@ -270,51 +231,8 @@ func (s *Session) run(ctx context.Context) {
 	}
 }
 
-func (s *Session) handleIncomingBlock(ctx context.Context, blk blkRecv) {
-	s.idleTick.Stop()
-
-	if blk.from != "" {
-		s.pm.RecordPeerResponse(blk.from, blk.blk.Cid())
-	}
-
-	s.receiveBlock(ctx, blk.blk)
-
-	s.resetIdleTick()
-}
-
-func (s *Session) handleNewRequest(ctx context.Context, keys []cid.Cid) {
-	for _, k := range keys {
-		s.interest.Add(k, nil)
-	}
-	if toadd := s.wantBudget(); toadd > 0 {
-		if toadd > len(keys) {
-			toadd = len(keys)
-		}
-
-		now := keys[:toadd]
-		keys = keys[toadd:]
-
-		s.wantBlocks(ctx, now)
-	}
-	for _, k := range keys {
-		s.tofetch.Push(k)
-	}
-}
-
-func (s *Session) handleCancel(keys []cid.Cid) {
-	for _, c := range keys {
-		s.tofetch.Remove(c)
-	}
-}
-
 func (s *Session) handleIdleTick(ctx context.Context) {
-
-	live := make([]cid.Cid, 0, len(s.liveWants))
-	now := time.Now()
-	for c := range s.liveWants {
-		live = append(live, c)
-		s.liveWants[c] = now
-	}
+	live := s.sw.PrepareBroadcast()
 
 	// Broadcast these keys to everyone we're connected to
 	s.pm.RecordPeerRequests(nil, live)
@@ -327,13 +245,13 @@ func (s *Session) handleIdleTick(ctx context.Context) {
 	}
 	s.resetIdleTick()
 
-	if len(s.liveWants) > 0 {
+	if s.sw.HasLiveWants() {
 		s.consecutiveTicks++
 	}
 }
 
 func (s *Session) handlePeriodicSearch(ctx context.Context) {
-	randomWant := s.randomLiveWant()
+	randomWant := s.sw.RandomLiveWant()
 	if !randomWant.Defined() {
 		return
 	}
@@ -346,83 +264,72 @@ func (s *Session) handlePeriodicSearch(ctx context.Context) {
 	s.periodicSearchTimer.Reset(s.periodicSearchDelay.NextWaitTime())
 }
 
-func (s *Session) randomLiveWant() cid.Cid {
-	if len(s.liveWants) == 0 {
-		return cid.Cid{}
-	}
-	i := rand.Intn(len(s.liveWants))
-	// picking a random live want
-	for k := range s.liveWants {
-		if i == 0 {
-			return k
-		}
-		i--
-	}
-	return cid.Cid{}
-}
 func (s *Session) handleShutdown() {
 	s.idleTick.Stop()
-	s.notif.Shutdown()
 
-	live := make([]cid.Cid, 0, len(s.liveWants))
-	for c := range s.liveWants {
-		live = append(live, c)
-	}
+	live := s.sw.LiveWants()
 	s.wm.CancelWants(s.ctx, live, nil, s.id)
 }
 
-func (s *Session) cidIsWanted(c cid.Cid) bool {
-	_, ok := s.liveWants[c]
-	if !ok {
-		ok = s.tofetch.Has(c)
+func (s *Session) handleReceive(ctx context.Context, from peer.ID, keys []cid.Cid) {
+	// Record statistics only if the blocks came from the network
+	// (blocks can also be received from the local node)
+	if from != "" {
+		s.updateReceiveCounters(ctx, from, keys)
 	}
-	return ok
+
+	// Update the want list
+	wanted, totalLatency := s.sw.BlocksReceived(keys)
+	if len(wanted) == 0 {
+		return
+	}
+
+	// We've received the blocks so we can cancel any outstanding wants for them
+	s.cancelIncoming(ctx, wanted)
+
+	s.idleTick.Stop()
+
+	// Process the received blocks
+	s.processReceive(ctx, wanted, totalLatency)
+
+	s.resetIdleTick()
 }
 
-func (s *Session) receiveBlock(ctx context.Context, blk blocks.Block) {
-	c := blk.Cid()
-	if s.cidIsWanted(c) {
-		s.srs.RecordUniqueBlock()
-		tval, ok := s.liveWants[c]
-		if ok {
-			s.latTotal += time.Since(tval)
-			delete(s.liveWants, c)
-		} else {
-			s.tofetch.Remove(c)
-		}
-		s.fetchcnt++
-		// we've received new wanted blocks, so future ticks are not consecutive
-		s.consecutiveTicks = 0
-		s.notif.Publish(blk)
+func (s *Session) updateReceiveCounters(ctx context.Context, from peer.ID, keys []cid.Cid) {
+	// Record unique vs duplicate blocks
+	s.sw.ForEachUniqDup(keys, s.srs.RecordUniqueBlock, s.srs.RecordDuplicateBlock)
 
-		toAdd := s.wantBudget()
-		if toAdd > s.tofetch.Len() {
-			toAdd = s.tofetch.Len()
-		}
-		if toAdd > 0 {
-			var keys []cid.Cid
-			for i := 0; i < toAdd; i++ {
-				keys = append(keys, s.tofetch.Pop())
-			}
-			s.wantBlocks(ctx, keys)
-		}
-
-		s.pastWants.Push(c)
+	// Record response (to be able to time latency)
+	if len(keys) > 0 {
+		s.pm.RecordPeerResponse(from, keys)
 	}
 }
 
-func (s *Session) updateReceiveCounters(ctx context.Context, blk blkRecv) {
-	ks := blk.blk.Cid()
-	if s.pastWants.Has(ks) {
-		s.srs.RecordDuplicateBlock()
-	}
+func (s *Session) cancelIncoming(ctx context.Context, ks []cid.Cid) {
+	s.pm.RecordCancels(ks)
+	s.wm.CancelWants(s.ctx, ks, nil, s.id)
 }
 
-func (s *Session) wantBlocks(ctx context.Context, ks []cid.Cid) {
-	now := time.Now()
-	for _, c := range ks {
-		s.liveWants[c] = now
+func (s *Session) processReceive(ctx context.Context, ks []cid.Cid, totalLatency time.Duration) {
+	// Keep track of the total number of blocks received and total latency
+	s.fetchcnt += len(ks)
+	s.latTotal += totalLatency
+
+	// We've received new wanted blocks, so reset the number of ticks
+	// that have occurred since the last new block
+	s.consecutiveTicks = 0
+
+	s.wantBlocks(ctx, nil)
+}
+
+func (s *Session) wantBlocks(ctx context.Context, newks []cid.Cid) {
+	// Given the want limit and any newly received blocks, get as many wants as
+	// we can to send out
+	ks := s.sw.GetNextWants(s.wantLimit(), newks)
+	if len(ks) == 0 {
+		return
 	}
+
 	peers := s.pm.GetOptimizedPeers()
 	if len(peers) > 0 {
 		splitRequests := s.srs.SplitRequest(peers, ks)
@@ -452,16 +359,9 @@ func (s *Session) resetIdleTick() {
 	s.idleTick.Reset(tickDelay)
 }
 
-func (s *Session) wantBudget() int {
-	live := len(s.liveWants)
-	var budget int
+func (s *Session) wantLimit() int {
 	if len(s.pm.GetOptimizedPeers()) > 0 {
-		budget = targetedLiveWantsLimit - live
-	} else {
-		budget = broadcastLiveWantsLimit - live
+		return targetedLiveWantsLimit
 	}
-	if budget < 0 {
-		budget = 0
-	}
-	return budget
+	return broadcastLiveWantsLimit
 }

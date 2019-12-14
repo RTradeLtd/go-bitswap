@@ -15,42 +15,68 @@ import (
 	ds "github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
+	process "github.com/jbenet/goprocess"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 	testutil "github.com/libp2p/go-libp2p-core/test"
 )
 
+type peerTag struct {
+	done  chan struct{}
+	peers map[peer.ID]int
+}
+
 type fakePeerTagger struct {
-	lk          sync.Mutex
-	wait        sync.WaitGroup
-	taggedPeers []peer.ID
+	lk   sync.Mutex
+	tags map[string]*peerTag
 }
 
 func (fpt *fakePeerTagger) TagPeer(p peer.ID, tag string, n int) {
-	fpt.wait.Add(1)
-
 	fpt.lk.Lock()
 	defer fpt.lk.Unlock()
-	fpt.taggedPeers = append(fpt.taggedPeers, p)
+	if fpt.tags == nil {
+		fpt.tags = make(map[string]*peerTag, 1)
+	}
+	pt, ok := fpt.tags[tag]
+	if !ok {
+		pt = &peerTag{peers: make(map[peer.ID]int, 1), done: make(chan struct{})}
+		fpt.tags[tag] = pt
+	}
+	pt.peers[p] = n
 }
 
 func (fpt *fakePeerTagger) UntagPeer(p peer.ID, tag string) {
-	defer fpt.wait.Done()
-
 	fpt.lk.Lock()
 	defer fpt.lk.Unlock()
-	for i := 0; i < len(fpt.taggedPeers); i++ {
-		if fpt.taggedPeers[i] == p {
-			fpt.taggedPeers[i] = fpt.taggedPeers[len(fpt.taggedPeers)-1]
-			fpt.taggedPeers = fpt.taggedPeers[:len(fpt.taggedPeers)-1]
-			return
-		}
+	pt := fpt.tags[tag]
+	if pt == nil {
+		return
+	}
+	delete(pt.peers, p)
+	if len(pt.peers) == 0 {
+		close(pt.done)
+		delete(fpt.tags, tag)
 	}
 }
 
-func (fpt *fakePeerTagger) count() int {
+func (fpt *fakePeerTagger) count(tag string) int {
 	fpt.lk.Lock()
 	defer fpt.lk.Unlock()
-	return len(fpt.taggedPeers)
+	if pt, ok := fpt.tags[tag]; ok {
+		return len(pt.peers)
+	}
+	return 0
+}
+
+func (fpt *fakePeerTagger) wait(tag string) {
+	fpt.lk.Lock()
+	pt := fpt.tags[tag]
+	if pt == nil {
+		fpt.lk.Unlock()
+		return
+	}
+	doneCh := pt.done
+	fpt.lk.Unlock()
+	<-doneCh
 }
 
 type engineSet struct {
@@ -63,13 +89,14 @@ type engineSet struct {
 func newEngine(ctx context.Context, idStr string) engineSet {
 	fpt := &fakePeerTagger{}
 	bs := blockstore.NewBlockstore(dssync.MutexWrap(ds.NewMapDatastore()))
+	e := NewEngine(ctx, bs, fpt)
+	e.StartWorkers(ctx, process.WithTeardown(func() error { return nil }))
 	return engineSet{
 		Peer: peer.ID(idStr),
 		//Strategy: New(true),
 		PeerTagger: fpt,
 		Blockstore: bs,
-		Engine: NewEngine(ctx,
-			bs, fpt),
+		Engine:     e,
 	}
 }
 
@@ -87,7 +114,7 @@ func TestConsistentAccounting(t *testing.T) {
 		m.AddBlock(blocks.NewBlock([]byte(strings.Join(content, " "))))
 
 		sender.Engine.MessageSent(receiver.Peer, m)
-		receiver.Engine.MessageReceived(sender.Peer, m)
+		receiver.Engine.MessageReceived(ctx, sender.Peer, m)
 	}
 
 	// Ensure sender records the change
@@ -117,7 +144,7 @@ func TestPeerIsAddedToPeersWhenMessageReceivedOrSent(t *testing.T) {
 	m := message.New(true)
 
 	sanfrancisco.Engine.MessageSent(seattle.Peer, m)
-	seattle.Engine.MessageReceived(sanfrancisco.Peer, m)
+	seattle.Engine.MessageReceived(ctx, sanfrancisco.Peer, m)
 
 	if seattle.Peer == sanfrancisco.Peer {
 		t.Fatal("Sanity Check: Peers have same Key!")
@@ -147,8 +174,10 @@ func peerIsPartner(p peer.ID, e *Engine) bool {
 }
 
 func TestOutboxClosedWhenEngineClosed(t *testing.T) {
+	ctx := context.Background()
 	t.SkipNow() // TODO implement *Engine.Close
-	e := NewEngine(context.Background(), blockstore.NewBlockstore(dssync.MutexWrap(ds.NewMapDatastore())), &fakePeerTagger{})
+	e := NewEngine(ctx, blockstore.NewBlockstore(dssync.MutexWrap(ds.NewMapDatastore())), &fakePeerTagger{})
+	e.StartWorkers(ctx, process.WithTeardown(func() error { return nil }))
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -203,9 +232,11 @@ func TestPartnerWantsThenCancels(t *testing.T) {
 		}
 	}
 
+	ctx := context.Background()
 	for i := 0; i < numRounds; i++ {
 		expected := make([][]string, 0, len(testcases))
-		e := NewEngine(context.Background(), bs, &fakePeerTagger{})
+		e := NewEngine(ctx, bs, &fakePeerTagger{})
+		e.StartWorkers(ctx, process.WithTeardown(func() error { return nil }))
 		for _, testcase := range testcases {
 			set := testcase[0]
 			cancels := testcase[1]
@@ -241,23 +272,63 @@ func TestTaggingPeers(t *testing.T) {
 	next := <-sanfrancisco.Engine.Outbox()
 	envelope := <-next
 
-	if sanfrancisco.PeerTagger.count() != 1 {
+	if sanfrancisco.PeerTagger.count(sanfrancisco.Engine.tagQueued) != 1 {
 		t.Fatal("Incorrect number of peers tagged")
 	}
 	envelope.Sent()
-	next = <-sanfrancisco.Engine.Outbox()
-	sanfrancisco.PeerTagger.wait.Wait()
-	if sanfrancisco.PeerTagger.count() != 0 {
+	<-sanfrancisco.Engine.Outbox()
+	sanfrancisco.PeerTagger.wait(sanfrancisco.Engine.tagQueued)
+	if sanfrancisco.PeerTagger.count(sanfrancisco.Engine.tagQueued) != 0 {
 		t.Fatal("Peers should be untagged but weren't")
 	}
 }
+
+func TestTaggingUseful(t *testing.T) {
+	oldShortTerm := shortTerm
+	shortTerm = 1 * time.Millisecond
+	defer func() { shortTerm = oldShortTerm }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	me := newEngine(ctx, "engine")
+	friend := peer.ID("friend")
+
+	block := blocks.NewBlock([]byte("foobar"))
+	msg := message.New(false)
+	msg.AddBlock(block)
+
+	for i := 0; i < 3; i++ {
+		if me.PeerTagger.count(me.Engine.tagUseful) != 0 {
+			t.Fatal("Peers should be untagged but weren't")
+		}
+		me.Engine.MessageSent(friend, msg)
+		time.Sleep(shortTerm * 2)
+		if me.PeerTagger.count(me.Engine.tagUseful) != 1 {
+			t.Fatal("Peers should be tagged but weren't")
+		}
+		time.Sleep(shortTerm * 8)
+	}
+
+	if me.PeerTagger.count(me.Engine.tagUseful) == 0 {
+		t.Fatal("peers should still be tagged due to long-term usefulness")
+	}
+	time.Sleep(shortTerm * 2)
+	if me.PeerTagger.count(me.Engine.tagUseful) == 0 {
+		t.Fatal("peers should still be tagged due to long-term usefulness")
+	}
+	time.Sleep(shortTerm * 20)
+	if me.PeerTagger.count(me.Engine.tagUseful) != 0 {
+		t.Fatal("peers should finally be untagged")
+	}
+}
+
 func partnerWants(e *Engine, keys []string, partner peer.ID) {
 	add := message.New(false)
 	for i, letter := range keys {
 		block := blocks.NewBlock([]byte(letter))
 		add.AddEntry(block.Cid(), len(keys)-i)
 	}
-	e.MessageReceived(partner, add)
+	e.MessageReceived(context.Background(), partner, add)
 }
 
 func partnerCancels(e *Engine, keys []string, partner peer.ID) {
@@ -266,7 +337,7 @@ func partnerCancels(e *Engine, keys []string, partner peer.ID) {
 		block := blocks.NewBlock([]byte(k))
 		cancels.Cancel(block.Cid())
 	}
-	e.MessageReceived(partner, cancels)
+	e.MessageReceived(context.Background(), partner, cancels)
 }
 
 func checkHandledInOrder(t *testing.T, e *Engine, expected [][]string) error {

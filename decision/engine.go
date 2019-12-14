@@ -10,12 +10,12 @@ import (
 	"github.com/google/uuid"
 	bsmsg "github.com/ipfs/go-bitswap/message"
 	wl "github.com/ipfs/go-bitswap/wantlist"
-	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	bstore "github.com/ipfs/go-ipfs-blockstore"
 	logging "github.com/ipfs/go-log"
 	"github.com/ipfs/go-peertaskqueue"
 	"github.com/ipfs/go-peertaskqueue/peertask"
+	process "github.com/jbenet/goprocess"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 )
 
@@ -56,13 +56,42 @@ var log = logging.Logger("engine")
 const (
 	// outboxChanBuffer must be 0 to prevent stale messages from being sent
 	outboxChanBuffer = 0
+	// Number of concurrent workers that pull tasks off the request queue
+	taskWorkerCount = 8
 	// maxMessageSize is the maximum size of the batched payload
 	maxMessageSize = 512 * 1024
-	// tagPrefix is the tag given to peers associated an engine
-	tagPrefix = "bs-engine-%s"
+	// tagFormat is the tag given to peers associated an engine
+	tagFormat = "bs-engine-%s-%s"
 
-	// tagWeight is the default weight for peers associated with an engine
-	tagWeight = 5
+	// queuedTagWeight is the default weight for peers that have work queued
+	// on their behalf.
+	queuedTagWeight = 10
+
+	// the alpha for the EWMA used to track short term usefulness
+	shortTermAlpha = 0.5
+
+	// the alpha for the EWMA used to track long term usefulness
+	longTermAlpha = 0.05
+
+	// long term ratio defines what "long term" means in terms of the
+	// shortTerm duration. Peers that interact once every longTermRatio are
+	// considered useful over the long term.
+	longTermRatio = 10
+
+	// long/short term scores for tagging peers
+	longTermScore  = 10 // this is a high tag but it grows _very_ slowly.
+	shortTermScore = 10 // this is a high tag but it'll go away quickly if we aren't using the peer.
+
+	// Number of concurrent workers that process requests to the blockstore
+	blockstoreWorkerCount = 128
+)
+
+var (
+	// how frequently the engine should sample usefulness. Peers that
+	// interact every shortTerm time period are considered "active".
+	//
+	// this is only a variable to make testing easier.
+	shortTerm = 10 * time.Second
 )
 
 // Envelope contains a message for a Peer.
@@ -102,40 +131,158 @@ type Engine struct {
 	// taskWorker goroutine
 	outbox chan (<-chan *Envelope)
 
-	bs bstore.Blockstore
+	bsm *blockstoreManager
 
 	peerTagger PeerTagger
 
-	tag  string
+	tagQueued, tagUseful string
+
 	lock sync.Mutex // protects the fields immediatly below
 	// ledgerMap lists Ledgers by their Partner key.
 	ledgerMap map[peer.ID]*ledger
 
 	ticker *time.Ticker
+
+	taskWorkerLock  sync.Mutex
+	taskWorkerCount int
 }
 
 // NewEngine creates a new block sending engine for the given block store
 func NewEngine(ctx context.Context, bs bstore.Blockstore, peerTagger PeerTagger) *Engine {
 	e := &Engine{
-		ledgerMap:  make(map[peer.ID]*ledger),
-		bs:         bs,
-		peerTagger: peerTagger,
-		outbox:     make(chan (<-chan *Envelope), outboxChanBuffer),
-		workSignal: make(chan struct{}, 1),
-		ticker:     time.NewTicker(time.Millisecond * 100),
+		ledgerMap:       make(map[peer.ID]*ledger),
+		bsm:             newBlockstoreManager(ctx, bs, blockstoreWorkerCount),
+		peerTagger:      peerTagger,
+		outbox:          make(chan (<-chan *Envelope), outboxChanBuffer),
+		workSignal:      make(chan struct{}, 1),
+		ticker:          time.NewTicker(time.Millisecond * 100),
+		taskWorkerCount: taskWorkerCount,
 	}
-	e.tag = fmt.Sprintf(tagPrefix, uuid.New().String())
-	e.peerRequestQueue = peertaskqueue.New(peertaskqueue.OnPeerAddedHook(e.onPeerAdded), peertaskqueue.OnPeerRemovedHook(e.onPeerRemoved))
-	go e.taskWorker(ctx)
+	e.tagQueued = fmt.Sprintf(tagFormat, "queued", uuid.New().String())
+	e.tagUseful = fmt.Sprintf(tagFormat, "useful", uuid.New().String())
+	e.peerRequestQueue = peertaskqueue.New(
+		peertaskqueue.OnPeerAddedHook(e.onPeerAdded),
+		peertaskqueue.OnPeerRemovedHook(e.onPeerRemoved))
+	go e.scoreWorker(ctx)
 	return e
 }
 
+// Start up workers to handle requests from other nodes for the data on this node
+func (e *Engine) StartWorkers(ctx context.Context, px process.Process) {
+	// Start up blockstore manager
+	e.bsm.start(px)
+
+	for i := 0; i < e.taskWorkerCount; i++ {
+		px.Go(func(px process.Process) {
+			e.taskWorker(ctx)
+		})
+	}
+}
+
+// scoreWorker keeps track of how "useful" our peers are, updating scores in the
+// connection manager.
+//
+// It does this by tracking two scores: short-term usefulness and long-term
+// usefulness. Short-term usefulness is sampled frequently and highly weights
+// new observations. Long-term usefulness is sampled less frequently and highly
+// weights on long-term trends.
+//
+// In practice, we do this by keeping two EWMAs. If we see an interaction
+// within the sampling period, we record the score, otherwise, we record a 0.
+// The short-term one has a high alpha and is sampled every shortTerm period.
+// The long-term one has a low alpha and is sampled every
+// longTermRatio*shortTerm period.
+//
+// To calculate the final score, we sum the short-term and long-term scores then
+// adjust it ±25% based on our debt ratio. Peers that have historically been
+// more useful to us than we are to them get the highest score.
+func (e *Engine) scoreWorker(ctx context.Context) {
+	ticker := time.NewTicker(shortTerm)
+	defer ticker.Stop()
+
+	type update struct {
+		peer  peer.ID
+		score int
+	}
+	var (
+		lastShortUpdate, lastLongUpdate time.Time
+		updates                         []update
+	)
+
+	for i := 0; ; i = (i + 1) % longTermRatio {
+		var now time.Time
+		select {
+		case now = <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+
+		// The long term update ticks every `longTermRatio` short
+		// intervals.
+		updateLong := i == 0
+
+		e.lock.Lock()
+		for _, ledger := range e.ledgerMap {
+			ledger.lk.Lock()
+
+			// Update the short-term score.
+			if ledger.lastExchange.After(lastShortUpdate) {
+				ledger.shortScore = ewma(ledger.shortScore, shortTermScore, shortTermAlpha)
+			} else {
+				ledger.shortScore = ewma(ledger.shortScore, 0, shortTermAlpha)
+			}
+
+			// Update the long-term score.
+			if updateLong {
+				if ledger.lastExchange.After(lastLongUpdate) {
+					ledger.longScore = ewma(ledger.longScore, longTermScore, longTermAlpha)
+				} else {
+					ledger.longScore = ewma(ledger.longScore, 0, longTermAlpha)
+				}
+			}
+
+			// Calculate the new score.
+			//
+			// The accounting score adjustment prefers peers _we_
+			// need over peers that need us. This doesn't help with
+			// leeching.
+			score := int((ledger.shortScore + ledger.longScore) * ((ledger.Accounting.Score())*.5 + .75))
+
+			// Avoid updating the connection manager unless there's a change. This can be expensive.
+			if ledger.score != score {
+				// put these in a list so we can perform the updates outside _global_ the lock.
+				updates = append(updates, update{ledger.Partner, score})
+				ledger.score = score
+			}
+			ledger.lk.Unlock()
+		}
+		e.lock.Unlock()
+
+		// record the times.
+		lastShortUpdate = now
+		if updateLong {
+			lastLongUpdate = now
+		}
+
+		// apply the updates
+		for _, update := range updates {
+			if update.score == 0 {
+				e.peerTagger.UntagPeer(update.peer, e.tagUseful)
+			} else {
+				e.peerTagger.TagPeer(update.peer, e.tagUseful, update.score)
+			}
+		}
+		// Keep the memory. It's not much and it saves us from having to allocate.
+		updates = updates[:0]
+	}
+}
+
 func (e *Engine) onPeerAdded(p peer.ID) {
-	e.peerTagger.TagPeer(p, e.tag, tagWeight)
+	e.peerTagger.TagPeer(p, e.tagQueued, queuedTagWeight)
 }
 
 func (e *Engine) onPeerRemoved(p peer.ID) {
-	e.peerTagger.UntagPeer(p, e.tag)
+	e.peerTagger.UntagPeer(p, e.tagQueued)
 }
 
 // WantlistForPeer returns the currently understood want list for a given peer
@@ -163,8 +310,11 @@ func (e *Engine) LedgerForPeer(p peer.ID) *Receipt {
 	}
 }
 
+// Each taskWorker pulls items off the request queue up and adds them to an
+// envelope. The envelope is passed off to the bitswap workers, which send
+// the message to the network.
 func (e *Engine) taskWorker(ctx context.Context) {
-	defer close(e.outbox) // because taskWorker uses the channel exclusively
+	defer e.taskWorkerExit()
 	for {
 		oneTimeUse := make(chan *Envelope, 1) // buffer to prevent blocking
 		select {
@@ -181,6 +331,17 @@ func (e *Engine) taskWorker(ctx context.Context) {
 		}
 		oneTimeUse <- envelope // buffered. won't block
 		close(oneTimeUse)
+	}
+}
+
+// taskWorkerExit handles cleanup of task workers
+func (e *Engine) taskWorkerExit() {
+	e.taskWorkerLock.Lock()
+	defer e.taskWorkerLock.Unlock()
+
+	e.taskWorkerCount--
+	if e.taskWorkerCount == 0 {
+		close(e.outbox)
 	}
 }
 
@@ -202,14 +363,15 @@ func (e *Engine) nextEnvelope(ctx context.Context) (*Envelope, error) {
 		}
 
 		// with a task in hand, we're ready to prepare the envelope...
+		blockCids := cid.NewSet()
+		for _, t := range nextTask.Tasks {
+			blockCids.Add(t.Identifier.(cid.Cid))
+		}
+		blks := e.bsm.getBlocks(ctx, blockCids.Keys())
+
 		msg := bsmsg.New(true)
-		for _, entry := range nextTask.Tasks {
-			block, err := e.bs.Get(entry.Identifier.(cid.Cid))
-			if err != nil {
-				log.Errorf("tried to execute a task and errored fetching block: %s", err)
-				continue
-			}
-			msg.AddBlock(block)
+		for _, b := range blks {
+			msg.AddBlock(b)
 		}
 
 		if msg.Empty() {
@@ -255,7 +417,7 @@ func (e *Engine) Peers() []peer.ID {
 
 // MessageReceived performs book-keeping. Returns error if passed invalid
 // arguments.
-func (e *Engine) MessageReceived(p peer.ID, m bsmsg.BitSwapMessage) {
+func (e *Engine) MessageReceived(ctx context.Context, p peer.ID, m bsmsg.BitSwapMessage) {
 	if m.Empty() {
 		log.Debugf("received empty message from %s", p)
 	}
@@ -266,6 +428,16 @@ func (e *Engine) MessageReceived(p peer.ID, m bsmsg.BitSwapMessage) {
 			e.signalNewWork()
 		}
 	}()
+
+	// Get block sizes
+	entries := m.Wantlist()
+	wantKs := cid.NewSet()
+	for _, entry := range entries {
+		if !entry.Cancel {
+			wantKs.Add(entry.Cid)
+		}
+	}
+	blockSizes := e.bsm.getBlockSizes(ctx, wantKs.Keys())
 
 	l := e.findOrCreate(p)
 	l.lk.Lock()
@@ -284,13 +456,8 @@ func (e *Engine) MessageReceived(p peer.ID, m bsmsg.BitSwapMessage) {
 		} else {
 			log.Debugf("wants %s - %d", entry.Cid, entry.Priority)
 			l.Wants(entry.Cid, entry.Priority)
-			blockSize, err := e.bs.GetSize(entry.Cid)
-			if err != nil {
-				if err == bstore.ErrNotFound {
-					continue
-				}
-				log.Error(err)
-			} else {
+			blockSize, ok := blockSizes[entry.Cid]
+			if ok {
 				// we have the block
 				newWorkExists = true
 				if msgSize+blockSize > maxMessageSize {
@@ -312,17 +479,19 @@ func (e *Engine) MessageReceived(p peer.ID, m bsmsg.BitSwapMessage) {
 	}
 }
 
-func (e *Engine) addBlock(block blocks.Block) {
+func (e *Engine) addBlocks(ks []cid.Cid) {
 	work := false
 
 	for _, l := range e.ledgerMap {
 		l.lk.Lock()
-		if entry, ok := l.WantListContains(block.Cid()); ok {
-			e.peerRequestQueue.PushBlock(l.Partner, peertask.Task{
-				Identifier: entry.Cid,
-				Priority:   entry.Priority,
-			})
-			work = true
+		for _, k := range ks {
+			if entry, ok := l.WantListContains(k); ok {
+				e.peerRequestQueue.PushBlock(l.Partner, peertask.Task{
+					Identifier: entry.Cid,
+					Priority:   entry.Priority,
+				})
+				work = true
+			}
 		}
 		l.lk.Unlock()
 	}
@@ -332,13 +501,14 @@ func (e *Engine) addBlock(block blocks.Block) {
 	}
 }
 
-// AddBlock is called to when a new block is received and added to a block store
-// meaning there may be peers who want that block that we should send it to.
-func (e *Engine) AddBlock(block blocks.Block) {
+// AddBlocks is called when new blocks are received and added to a block store,
+// meaning there may be peers who want those blocks, so we should send the blocks
+// to them.
+func (e *Engine) AddBlocks(ks []cid.Cid) {
 	e.lock.Lock()
 	defer e.lock.Unlock()
 
-	e.addBlock(block)
+	e.addBlocks(ks)
 }
 
 // TODO add contents of m.WantList() to my local wantlist? NB: could introduce
@@ -357,9 +527,7 @@ func (e *Engine) MessageSent(p peer.ID, m bsmsg.BitSwapMessage) {
 	for _, block := range m.Blocks() {
 		l.SentBytes(len(block.RawData()))
 		l.wantList.Remove(block.Cid())
-		e.peerRequestQueue.Remove(block.Cid(), p)
 	}
-
 }
 
 // PeerConnected is called when a new peer connects, meaning we should start

@@ -21,6 +21,7 @@ import (
 	blocksutil "github.com/ipfs/go-ipfs-blocksutil"
 	delay "github.com/ipfs/go-ipfs-delay"
 	mockrouting "github.com/ipfs/go-ipfs-routing/mock"
+	peer "github.com/libp2p/go-libp2p-core/peer"
 	p2ptestutil "github.com/libp2p/go-libp2p-netutil"
 	travis "github.com/libp2p/go-libp2p-testing/ci/travis"
 	tu "github.com/libp2p/go-libp2p-testing/etc"
@@ -44,7 +45,10 @@ func TestClose(t *testing.T) {
 	bitswap := ig.Next()
 
 	bitswap.Exchange.Close()
-	bitswap.Exchange.GetBlock(context.Background(), block.Cid())
+	_, err := bitswap.Exchange.GetBlock(context.Background(), block.Cid())
+	if err == nil {
+		t.Fatal("expected GetBlock to fail")
+	}
 }
 
 func TestProviderForKeyButNetworkCannotFind(t *testing.T) { // TODO revisit this
@@ -56,14 +60,17 @@ func TestProviderForKeyButNetworkCannotFind(t *testing.T) { // TODO revisit this
 
 	block := blocks.NewBlock([]byte("block"))
 	pinfo := p2ptestutil.RandTestBogusIdentityOrFatal(t)
-	rs.Client(pinfo).Provide(context.Background(), block.Cid(), true) // but not on network
+	err := rs.Client(pinfo).Provide(context.Background(), block.Cid(), true) // but not on network
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	solo := ig.Next()
 	defer solo.Exchange.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
 	defer cancel()
-	_, err := solo.Exchange.GetBlock(ctx, block.Cid())
+	_, err = solo.Exchange.GetBlock(ctx, block.Cid())
 
 	if err != context.DeadlineExceeded {
 		t.Fatal("Expected DeadlineExceeded error")
@@ -132,6 +139,8 @@ func TestDoesNotProvideWhenConfiguredNotTo(t *testing.T) {
 	}
 }
 
+// Tests that a received block is not stored in the blockstore if the block was
+// not requested by the client
 func TestUnwantedBlockNotAdded(t *testing.T) {
 
 	net := tn.VirtualNetwork(mockrouting.NewServer(), delay.Fixed(kNetworkDelay))
@@ -161,6 +170,68 @@ func TestUnwantedBlockNotAdded(t *testing.T) {
 	blockInStore, err := doesNotWantBlock.Blockstore().Has(block.Cid())
 	if err != nil || blockInStore {
 		t.Fatal("Unwanted block added to block store")
+	}
+}
+
+// Tests that a received block is returned to the client and stored in the
+// blockstore in the following scenario:
+// - the want for the block has been requested by the client
+// - the want for the block has not yet been sent out to a peer
+//   (because the live request queue is full)
+func TestPendingBlockAdded(t *testing.T) {
+	ctx := context.Background()
+	net := tn.VirtualNetwork(mockrouting.NewServer(), delay.Fixed(kNetworkDelay))
+	bg := blocksutil.NewBlockGenerator()
+	sessionBroadcastWantCapacity := 4
+
+	ig := testinstance.NewTestInstanceGenerator(net)
+	defer ig.Close()
+
+	instance := ig.Instances(1)[0]
+	defer instance.Exchange.Close()
+
+	oneSecCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	// Request enough blocks to exceed the session's broadcast want list
+	// capacity (by one block). The session will put the remaining block
+	// into the "tofetch" queue
+	blks := bg.Blocks(sessionBroadcastWantCapacity + 1)
+	ks := make([]cid.Cid, 0, len(blks))
+	for _, b := range blks {
+		ks = append(ks, b.Cid())
+	}
+	outch, err := instance.Exchange.GetBlocks(ctx, ks)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait a little while to make sure the session has time to process the wants
+	time.Sleep(time.Millisecond * 20)
+
+	// Simulate receiving a message which contains the block in the "tofetch" queue
+	lastBlock := blks[len(blks)-1]
+	bsMessage := message.New(true)
+	bsMessage.AddBlock(lastBlock)
+	unknownPeer := peer.ID("QmUHfvCQrzyR6vFXmeyCptfCWedfcmfa12V6UuziDtrw23")
+	instance.Exchange.ReceiveMessage(oneSecCtx, unknownPeer, bsMessage)
+
+	// Make sure Bitswap adds the block to the output channel
+	blkrecvd, ok := <-outch
+	if !ok {
+		t.Fatal("timed out waiting for block")
+	}
+	if !blkrecvd.Cid().Equals(lastBlock.Cid()) {
+		t.Fatal("received wrong block")
+	}
+
+	// Make sure Bitswap adds the block to the blockstore
+	blockInStore, err := instance.Blockstore().Has(lastBlock.Cid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !blockInStore {
+		t.Fatal("Block was not added to block store")
 	}
 }
 
@@ -224,7 +295,10 @@ func PerformDistributionTest(t *testing.T, numInstances, numBlocks int) {
 	first := instances[0]
 	for _, b := range blocks {
 		blkeys = append(blkeys, b.Cid())
-		first.Exchange.HasBlock(b)
+		err := first.Exchange.HasBlock(b)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	t.Log("Distribute!")
@@ -357,6 +431,8 @@ func TestBasicBitswap(t *testing.T) {
 
 	instances := ig.Instances(3)
 	blocks := bg.Blocks(1)
+
+	// First peer has block
 	err := instances[0].Exchange.HasBlock(blocks[0])
 	if err != nil {
 		t.Fatal(err)
@@ -364,11 +440,16 @@ func TestBasicBitswap(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
+
+	// Second peer broadcasts want for block CID
+	// (Received by first and third peers)
 	blk, err := instances[1].Exchange.GetBlock(ctx, blocks[0].Cid())
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	// When second peer receives block, it should send out a cancel, so third
+	// peer should no longer keep second peer's want
 	if err = tu.WaitFor(ctx, func() error {
 		if len(instances[2].Exchange.WantlistForPeer(instances[1].Peer)) != 0 {
 			return fmt.Errorf("should have no items in other peers wantlist")
