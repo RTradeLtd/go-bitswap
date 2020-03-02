@@ -5,24 +5,26 @@ package bitswap
 import (
 	"context"
 	"errors"
+
 	"sync"
 	"time"
 
-	bssrs "github.com/ipfs/go-bitswap/sessionrequestsplitter"
 	delay "github.com/ipfs/go-ipfs-delay"
 
-	decision "github.com/ipfs/go-bitswap/decision"
-	bsgetter "github.com/ipfs/go-bitswap/getter"
+	bsbpm "github.com/ipfs/go-bitswap/internal/blockpresencemanager"
+	decision "github.com/ipfs/go-bitswap/internal/decision"
+	bsgetter "github.com/ipfs/go-bitswap/internal/getter"
+	bsmq "github.com/ipfs/go-bitswap/internal/messagequeue"
+	notifications "github.com/ipfs/go-bitswap/internal/notifications"
+	bspm "github.com/ipfs/go-bitswap/internal/peermanager"
+	bspqm "github.com/ipfs/go-bitswap/internal/providerquerymanager"
+	bssession "github.com/ipfs/go-bitswap/internal/session"
+	bssim "github.com/ipfs/go-bitswap/internal/sessioninterestmanager"
+	bssm "github.com/ipfs/go-bitswap/internal/sessionmanager"
+	bsspm "github.com/ipfs/go-bitswap/internal/sessionpeermanager"
+	bswm "github.com/ipfs/go-bitswap/internal/wantmanager"
 	bsmsg "github.com/ipfs/go-bitswap/message"
-	bsmq "github.com/ipfs/go-bitswap/messagequeue"
 	bsnet "github.com/ipfs/go-bitswap/network"
-	notifications "github.com/ipfs/go-bitswap/notifications"
-	bspm "github.com/ipfs/go-bitswap/peermanager"
-	bspqm "github.com/ipfs/go-bitswap/providerquerymanager"
-	bssession "github.com/ipfs/go-bitswap/session"
-	bssm "github.com/ipfs/go-bitswap/sessionmanager"
-	bsspm "github.com/ipfs/go-bitswap/sessionpeermanager"
-	bswm "github.com/ipfs/go-bitswap/wantmanager"
 	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
@@ -82,6 +84,17 @@ func RebroadcastDelay(newRebroadcastDelay delay.D) Option {
 	}
 }
 
+// SetSendDontHaves indicates what to do when the engine receives a want-block
+// for a block that is not in the blockstore. Either
+// - Send a DONT_HAVE message
+// - Simply don't respond
+// This option is only used for testing.
+func SetSendDontHaves(send bool) Option {
+	return func(bs *Bitswap) {
+		bs.engine.SetSendDontHaves(send)
+	}
+}
+
 // New initializes a BitSwap instance that communicates over the provided
 // BitSwapNetwork. This function registers the returned instance as the network
 // delegate. Runs until context is cancelled or bitswap.Close is called.
@@ -109,28 +122,42 @@ func New(parent context.Context, network bsnet.BitSwapNetwork,
 		return nil
 	})
 
+	var wm *bswm.WantManager
+	// onDontHaveTimeout is called when a want-block is sent to a peer that
+	// has an old version of Bitswap that doesn't support DONT_HAVE messages,
+	// and no response is received within a timeout.
+	onDontHaveTimeout := func(p peer.ID, dontHaves []cid.Cid) {
+		// Simulate a DONT_HAVE message arriving to the WantManager
+		wm.ReceiveFrom(ctx, p, nil, nil, dontHaves)
+	}
 	peerQueueFactory := func(ctx context.Context, p peer.ID) bspm.PeerQueue {
-		return bsmq.New(ctx, p, network)
+		return bsmq.New(ctx, p, network, onDontHaveTimeout)
 	}
 
-	wm := bswm.New(ctx, bspm.New(ctx, peerQueueFactory))
+	sim := bssim.New()
+	bpm := bsbpm.New()
+	pm := bspm.New(ctx, peerQueueFactory, network.Self())
+	wm = bswm.New(ctx, pm, sim, bpm)
 	pqm := bspqm.New(ctx, network)
 
-	sessionFactory := func(ctx context.Context, id uint64, pm bssession.PeerManager, srs bssession.RequestSplitter,
+	sessionFactory := func(ctx context.Context, id uint64, spm bssession.SessionPeerManager,
+		sim *bssim.SessionInterestManager,
+		pm bssession.PeerManager,
+		bpm *bsbpm.BlockPresenceManager,
 		notif notifications.PubSub,
 		provSearchDelay time.Duration,
-		rebroadcastDelay delay.D) bssm.Session {
-		return bssession.New(ctx, id, wm, pm, srs, notif, provSearchDelay, rebroadcastDelay)
+		rebroadcastDelay delay.D,
+		self peer.ID) bssm.Session {
+		return bssession.New(ctx, id, wm, spm, sim, pm, bpm, notif, provSearchDelay, rebroadcastDelay, self)
 	}
-	sessionPeerManagerFactory := func(ctx context.Context, id uint64) bssession.PeerManager {
+	sessionPeerManagerFactory := func(ctx context.Context, id uint64) bssession.SessionPeerManager {
 		return bsspm.New(ctx, id, network.ConnectionManager(), pqm)
 	}
-	sessionRequestSplitterFactory := func(ctx context.Context) bssession.RequestSplitter {
-		return bssrs.New(ctx)
-	}
 	notif := notifications.New()
+	sm := bssm.New(ctx, sessionFactory, sim, sessionPeerManagerFactory, bpm, pm, notif, network.Self())
+	wm.SetSessionManager(sm)
+	engine := decision.NewEngine(ctx, bstore, network.ConnectionManager(), network.Self())
 
-	engine := decision.NewEngine(ctx, bstore, network.ConnectionManager()) // TODO close the engine with Close() method
 	bs := &Bitswap{
 		blockstore:       bstore,
 		engine:           engine,
@@ -139,8 +166,10 @@ func New(parent context.Context, network bsnet.BitSwapNetwork,
 		newBlocks:        make(chan cid.Cid, HasBlockBufferSize),
 		provideKeys:      make(chan cid.Cid, provideKeysBufferSize),
 		wm:               wm,
+		pm:               pm,
 		pqm:              pqm,
-		sm:               bssm.New(ctx, sessionFactory, sessionPeerManagerFactory, sessionRequestSplitterFactory, notif),
+		sm:               sm,
+		sim:              sim,
 		notif:            notif,
 		counters:         new(counters),
 		dupMetric:        dupHist,
@@ -156,7 +185,6 @@ func New(parent context.Context, network bsnet.BitSwapNetwork,
 		option(bs)
 	}
 
-	bs.wm.Startup()
 	bs.pqm.Startup()
 	network.SetDelegate(bs)
 
@@ -180,6 +208,8 @@ func New(parent context.Context, network bsnet.BitSwapNetwork,
 type Bitswap struct {
 	// the wantlist tracks global wants for bitswap
 	wm *bswm.WantManager
+
+	pm *bspm.PeerManager
 
 	// the provider query manager manages requests to find providers
 	pqm *bspqm.ProviderQueryManager
@@ -215,8 +245,12 @@ type Bitswap struct {
 	allMetric     metrics.Histogram
 	sentHistogram metrics.Histogram
 
-	// the sessionmanager manages tracking sessions
+	// the SessionManager routes requests to interested sessions
 	sm *bssm.SessionManager
+
+	// the SessionInterestManager keeps track of which sessions are interested
+	// in which CIDs
+	sim *bssim.SessionInterestManager
 
 	// whether or not to make provide announcements
 	provideEnabled bool
@@ -275,14 +309,14 @@ func (bs *Bitswap) GetBlocks(ctx context.Context, keys []cid.Cid) (<-chan blocks
 // HasBlock announces the existence of a block to this bitswap service. The
 // service will potentially notify its peers.
 func (bs *Bitswap) HasBlock(blk blocks.Block) error {
-	return bs.receiveBlocksFrom(context.Background(), "", []blocks.Block{blk})
+	return bs.receiveBlocksFrom(context.Background(), "", []blocks.Block{blk}, nil, nil)
 }
 
 // TODO: Some of this stuff really only needs to be done when adding a block
 // from the user, not when receiving it from the network.
 // In case you run `git blame` on this comment, I'll save you some time: ask
 // @whyrusleeping, I don't know the answers you seek.
-func (bs *Bitswap) receiveBlocksFrom(ctx context.Context, from peer.ID, blks []blocks.Block) error {
+func (bs *Bitswap) receiveBlocksFrom(ctx context.Context, from peer.ID, blks []blocks.Block, haves []cid.Cid, dontHaves []cid.Cid) error {
 	select {
 	case <-bs.process.Closing():
 		return errors.New("bitswap is closed")
@@ -293,22 +327,20 @@ func (bs *Bitswap) receiveBlocksFrom(ctx context.Context, from peer.ID, blks []b
 
 	// If blocks came from the network
 	if from != "" {
-		// Split blocks into wanted blocks vs duplicates
-		wanted = make([]blocks.Block, 0, len(blks))
-		for _, b := range blks {
-			if bs.sm.IsWanted(b.Cid()) {
-				wanted = append(wanted, b)
-			} else {
-				log.Debugf("[recv] block not in wantlist; cid=%s, peer=%s", b.Cid(), from)
-			}
+		var notWanted []blocks.Block
+		wanted, notWanted = bs.sim.SplitWantedUnwanted(blks)
+		for _, b := range notWanted {
+			log.Debugf("[recv] block not in wantlist; cid=%s, peer=%s", b.Cid(), from)
 		}
 	}
 
 	// Put wanted blocks into blockstore
-	err := bs.blockstore.PutMany(wanted)
-	if err != nil {
-		log.Errorf("Error writing %d blocks to datastore: %s", len(wanted), err)
-		return err
+	if len(wanted) > 0 {
+		err := bs.blockstore.PutMany(wanted)
+		if err != nil {
+			log.Errorf("Error writing %d blocks to datastore: %s", len(wanted), err)
+			return err
+		}
 	}
 
 	// NOTE: There exists the possiblity for a race condition here.  If a user
@@ -322,23 +354,15 @@ func (bs *Bitswap) receiveBlocksFrom(ctx context.Context, from peer.ID, blks []b
 		allKs = append(allKs, b.Cid())
 	}
 
-	wantedKs := allKs
-	if len(blks) != len(wanted) {
-		wantedKs = make([]cid.Cid, 0, len(wanted))
-		for _, b := range wanted {
-			wantedKs = append(wantedKs, b.Cid())
-		}
-	}
-
 	// Send all block keys (including duplicates) to any sessions that want them.
 	// (The duplicates are needed by sessions for accounting purposes)
-	bs.sm.ReceiveFrom(from, allKs)
+	bs.wm.ReceiveFrom(ctx, from, allKs, haves, dontHaves)
 
-	// Send wanted block keys to decision engine
-	bs.engine.AddBlocks(wantedKs)
+	// Send wanted blocks to decision engine
+	bs.engine.ReceiveFrom(from, wanted, haves)
 
 	// Publish the block to any Bitswap clients that had requested blocks.
-	// (the sessions use this pubsub mechanism to inform clients of received
+	// (the sessions use this pubsub mechanism to inform clients of incoming
 	// blocks)
 	for _, b := range wanted {
 		bs.notif.Publish(b)
@@ -346,9 +370,9 @@ func (bs *Bitswap) receiveBlocksFrom(ctx context.Context, from peer.ID, blks []b
 
 	// If the reprovider is enabled, send wanted blocks to reprovider
 	if bs.provideEnabled {
-		for _, k := range wantedKs {
+		for _, blk := range wanted {
 			select {
-			case bs.newBlocks <- k:
+			case bs.newBlocks <- blk.Cid():
 				// send block off to be reprovided
 			case <-bs.process.Closing():
 				return bs.process.Close()
@@ -358,7 +382,7 @@ func (bs *Bitswap) receiveBlocksFrom(ctx context.Context, from peer.ID, blks []b
 
 	if from != "" {
 		for _, b := range wanted {
-			log.Event(ctx, "Bitswap.GetBlockRequest.End", b.Cid())
+			log.Debugw("Bitswap.GetBlockRequest.End", "cid", b.Cid())
 		}
 	}
 
@@ -380,20 +404,22 @@ func (bs *Bitswap) ReceiveMessage(ctx context.Context, p peer.ID, incoming bsmsg
 
 	iblocks := incoming.Blocks()
 
-	if len(iblocks) == 0 {
-		return
+	if len(iblocks) > 0 {
+		bs.updateReceiveCounters(iblocks)
+		for _, b := range iblocks {
+			log.Debugf("[recv] block; cid=%s, peer=%s", b.Cid(), p)
+		}
 	}
 
-	bs.updateReceiveCounters(iblocks)
-	for _, b := range iblocks {
-		log.Debugf("[recv] block; cid=%s, peer=%s", b.Cid(), p)
-	}
-
-	// Process blocks
-	err := bs.receiveBlocksFrom(ctx, p, iblocks)
-	if err != nil {
-		log.Warningf("ReceiveMessage recvBlockFrom error: %s", err)
-		return
+	haves := incoming.Haves()
+	dontHaves := incoming.DontHaves()
+	if len(iblocks) > 0 || len(haves) > 0 || len(dontHaves) > 0 {
+		// Process blocks
+		err := bs.receiveBlocksFrom(ctx, p, iblocks, haves, dontHaves)
+		if err != nil {
+			log.Warnf("ReceiveMessage recvBlockFrom error: %s", err)
+			return
+		}
 	}
 }
 
@@ -479,12 +505,12 @@ func (bs *Bitswap) Close() error {
 
 // GetWantlist returns the current local wantlist.
 func (bs *Bitswap) GetWantlist() []cid.Cid {
-	entries := bs.wm.CurrentWants()
-	out := make([]cid.Cid, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, e.Cid)
-	}
-	return out
+	return bs.pm.CurrentWants()
+}
+
+// GetWanthaves returns the current list of want-haves.
+func (bs *Bitswap) GetWantHaves() []cid.Cid {
+	return bs.pm.CurrentWantHaves()
 }
 
 // IsOnline is needed to match go-ipfs-exchange-interface

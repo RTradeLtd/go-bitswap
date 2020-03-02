@@ -2,11 +2,12 @@ package bitswap
 
 import (
 	"context"
+	"fmt"
 
-	engine "github.com/ipfs/go-bitswap/decision"
+	engine "github.com/ipfs/go-bitswap/internal/decision"
 	bsmsg "github.com/ipfs/go-bitswap/message"
+	pb "github.com/ipfs/go-bitswap/message/pb"
 	cid "github.com/ipfs/go-cid"
-	logging "github.com/ipfs/go-log"
 	process "github.com/jbenet/goprocess"
 	procctx "github.com/jbenet/goprocess/context"
 )
@@ -39,10 +40,10 @@ func (bs *Bitswap) startWorkers(ctx context.Context, px process.Process) {
 }
 
 func (bs *Bitswap) taskWorker(ctx context.Context, id int) {
-	idmap := logging.LoggableMap{"ID": id}
 	defer log.Debug("bitswap task worker shutting down...")
+	log := log.With("ID", id)
 	for {
-		log.Event(ctx, "Bitswap.TaskWorker.Loop", idmap)
+		log.Debug("Bitswap.TaskWorker.Loop")
 		select {
 		case nextEnvelope := <-bs.engine.Outbox():
 			select {
@@ -50,19 +51,21 @@ func (bs *Bitswap) taskWorker(ctx context.Context, id int) {
 				if !ok {
 					continue
 				}
+
 				// update the BS ledger to reflect sent message
 				// TODO: Should only track *useful* messages in ledger
 				outgoing := bsmsg.New(false)
 				for _, block := range envelope.Message.Blocks() {
-					log.Event(ctx, "Bitswap.TaskWorker.Work", logging.LoggableF(func() map[string]interface{} {
-						return logging.LoggableMap{
-							"ID":     id,
-							"Target": envelope.Peer.Pretty(),
-							"Block":  block.Cid().String(),
-						}
-					}))
+					log.Debugw("Bitswap.TaskWorker.Work",
+						"Target", envelope.Peer,
+						"Block", block.Cid(),
+					)
 					outgoing.AddBlock(block)
 				}
+				for _, blockPresence := range envelope.Message.BlockPresences() {
+					outgoing.AddBlockPresence(blockPresence.Cid, blockPresence.Type)
+				}
+				// TODO: Only record message as sent if there was no error?
 				bs.engine.MessageSent(envelope.Peer, outgoing)
 
 				bs.sendBlocks(ctx, envelope)
@@ -88,6 +91,21 @@ func (bs *Bitswap) sendBlocks(ctx context.Context, env *engine.Envelope) {
 
 	msgSize := 0
 	msg := bsmsg.New(false)
+
+	for _, blockPresence := range env.Message.BlockPresences() {
+		c := blockPresence.Cid
+		switch blockPresence.Type {
+		case pb.Message_Have:
+			log.Infof("Sending HAVE %s to %s", c.String()[2:8], env.Peer)
+		case pb.Message_DontHave:
+			log.Infof("Sending DONT_HAVE %s to %s", c.String()[2:8], env.Peer)
+		default:
+			panic(fmt.Sprintf("unrecognized BlockPresence type %v", blockPresence.Type))
+		}
+
+		msgSize += bsmsg.BlockPresenceSize(c)
+		msg.AddBlockPresence(c, blockPresence.Type)
+	}
 	for _, block := range env.Message.Blocks() {
 		msgSize += len(block.RawData())
 		msg.AddBlock(block)
@@ -97,8 +115,10 @@ func (bs *Bitswap) sendBlocks(ctx context.Context, env *engine.Envelope) {
 	bs.sentHistogram.Observe(float64(msgSize))
 	err := bs.network.SendMessage(ctx, env.Peer, msg)
 	if err != nil {
-		log.Infof("sendblock error: %s", err)
+		// log.Infof("sendblock error: %s", err)
+		log.Errorf("SendMessage error: %s. size: %d. block-presence length: %d", err, msg.Size(), len(env.Message.BlockPresences()))
 	}
+	log.Infof("Sent message to %s", env.Peer)
 }
 
 func (bs *Bitswap) provideWorker(px process.Process) {
@@ -119,9 +139,9 @@ func (bs *Bitswap) provideWorker(px process.Process) {
 			// replace token when done
 			<-limit
 		}()
-		ev := logging.LoggableMap{"ID": wid}
 
-		defer log.EventBegin(ctx, "Bitswap.ProvideWorker.Work", ev, k).Done()
+		log.Debugw("Bitswap.ProvideWorker.Start", "ID", wid, "cid", k)
+		defer log.Debugw("Bitswap.ProvideWorker.End", "ID", wid, "cid", k)
 
 		ctx, cancel := context.WithTimeout(ctx, provideTimeout) // timeout ctx
 		defer cancel()
@@ -134,8 +154,7 @@ func (bs *Bitswap) provideWorker(px process.Process) {
 	// worker spawner, reads from bs.provideKeys until it closes, spawning a
 	// _ratelimited_ number of workers to handle each key.
 	for wid := 2; ; wid++ {
-		ev := logging.LoggableMap{"ID": 1}
-		log.Event(ctx, "Bitswap.ProvideWorker.Loop", ev)
+		log.Debug("Bitswap.ProvideWorker.Loop")
 
 		select {
 		case <-px.Closing():
