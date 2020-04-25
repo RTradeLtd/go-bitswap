@@ -11,19 +11,20 @@ import (
 
 const (
 	// dontHaveTimeout is used to simulate a DONT_HAVE when communicating with
-	// a peer whose Bitswap client doesn't support the DONT_HAVE response.
+	// a peer whose Bitswap client doesn't support the DONT_HAVE response,
+	// or when the peer takes too long to respond.
 	// If the peer doesn't respond to a want-block within the timeout, the
 	// local node assumes that the peer doesn't have the block.
 	dontHaveTimeout = 5 * time.Second
 
 	// maxExpectedWantProcessTime is the maximum amount of time we expect a
 	// peer takes to process a want and initiate sending a response to us
-	maxExpectedWantProcessTime = 200 * time.Millisecond
+	maxExpectedWantProcessTime = 2 * time.Second
 
 	// latencyMultiplier is multiplied by the average ping time to
 	// get an upper bound on how long we expect to wait for a peer's response
 	// to arrive
-	latencyMultiplier = 2
+	latencyMultiplier = 3
 )
 
 // PeerConnection is a connection to a peer that can be pinged, and the
@@ -45,7 +46,7 @@ type pendingWant struct {
 
 // dontHaveTimeoutMgr pings the peer to measure latency. It uses the latency to
 // set a reasonable timeout for simulating a DONT_HAVE message for peers that
-// don't support DONT_HAVE
+// don't support DONT_HAVE or that take to long to respond.
 type dontHaveTimeoutMgr struct {
 	ctx                        context.Context
 	shutdown                   func()
@@ -71,17 +72,17 @@ type dontHaveTimeoutMgr struct {
 
 // newDontHaveTimeoutMgr creates a new dontHaveTimeoutMgr
 // onDontHaveTimeout is called when pending keys expire (not cancelled before timeout)
-func newDontHaveTimeoutMgr(ctx context.Context, pc PeerConnection, onDontHaveTimeout func([]cid.Cid)) *dontHaveTimeoutMgr {
-	return newDontHaveTimeoutMgrWithParams(ctx, pc, onDontHaveTimeout, dontHaveTimeout,
+func newDontHaveTimeoutMgr(pc PeerConnection, onDontHaveTimeout func([]cid.Cid)) *dontHaveTimeoutMgr {
+	return newDontHaveTimeoutMgrWithParams(pc, onDontHaveTimeout, dontHaveTimeout,
 		latencyMultiplier, maxExpectedWantProcessTime)
 }
 
 // newDontHaveTimeoutMgrWithParams is used by the tests
-func newDontHaveTimeoutMgrWithParams(ctx context.Context, pc PeerConnection, onDontHaveTimeout func([]cid.Cid),
+func newDontHaveTimeoutMgrWithParams(pc PeerConnection, onDontHaveTimeout func([]cid.Cid),
 	defaultTimeout time.Duration, latencyMultiplier int,
 	maxExpectedWantProcessTime time.Duration) *dontHaveTimeoutMgr {
 
-	ctx, shutdown := context.WithCancel(ctx)
+	ctx, shutdown := context.WithCancel(context.Background())
 	mqp := &dontHaveTimeoutMgr{
 		ctx:                        ctx,
 		shutdown:                   shutdown,
@@ -100,10 +101,7 @@ func newDontHaveTimeoutMgrWithParams(ctx context.Context, pc PeerConnection, onD
 // Shutdown the dontHaveTimeoutMgr. Any subsequent call to Start() will be ignored
 func (dhtm *dontHaveTimeoutMgr) Shutdown() {
 	dhtm.shutdown()
-}
 
-// onShutdown is called when the dontHaveTimeoutMgr shuts down
-func (dhtm *dontHaveTimeoutMgr) onShutdown() {
 	dhtm.lk.Lock()
 	defer dhtm.lk.Unlock()
 
@@ -111,13 +109,6 @@ func (dhtm *dontHaveTimeoutMgr) onShutdown() {
 	if dhtm.checkForTimeoutsTimer != nil {
 		dhtm.checkForTimeoutsTimer.Stop()
 	}
-}
-
-// closeAfterContext is called when the dontHaveTimeoutMgr starts.
-// It monitors for the context being cancelled.
-func (dhtm *dontHaveTimeoutMgr) closeAfterContext() {
-	<-dhtm.ctx.Done()
-	dhtm.onShutdown()
 }
 
 // Start the dontHaveTimeoutMgr. This method is idempotent
@@ -130,8 +121,6 @@ func (dhtm *dontHaveTimeoutMgr) Start() {
 		return
 	}
 	dhtm.started = true
-
-	go dhtm.closeAfterContext()
 
 	// If we already have a measure of latency to the peer, use it to
 	// calculate a reasonable timeout

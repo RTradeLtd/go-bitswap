@@ -19,8 +19,8 @@ import (
 
 	bitswap "github.com/ipfs/go-bitswap"
 	bssession "github.com/ipfs/go-bitswap/internal/session"
-	testinstance "github.com/ipfs/go-bitswap/internal/testinstance"
-	tn "github.com/ipfs/go-bitswap/internal/testnet"
+	testinstance "github.com/ipfs/go-bitswap/testinstance"
+	tn "github.com/ipfs/go-bitswap/testnet"
 	bsnet "github.com/ipfs/go-bitswap/network"
 	cid "github.com/ipfs/go-cid"
 	delay "github.com/ipfs/go-ipfs-delay"
@@ -130,7 +130,7 @@ var mixedBenches = []mixedBench{
 	mixedBench{bench{"3Nodes-Overlap3-OneAtATime", 3, 10, overlap2, oneAtATime}, 1, 2},
 	mixedBench{bench{"3Nodes-AllToAll-OneAtATime", 3, 10, allToAll, oneAtATime}, 1, 2},
 	mixedBench{bench{"3Nodes-Overlap3-AllConcurrent", 3, 10, overlap2, fetchAllConcurrent}, 1, 2},
-	mixedBench{bench{"3Nodes-Overlap3-UnixfsFetch", 3, 100, overlap2, unixfsFileFetch}, 1, 2},
+	// mixedBench{bench{"3Nodes-Overlap3-UnixfsFetch", 3, 100, overlap2, unixfsFileFetch}, 1, 2},
 }
 
 func BenchmarkFetchFromOldBitswap(b *testing.B) {

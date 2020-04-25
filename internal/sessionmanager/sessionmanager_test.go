@@ -45,19 +45,24 @@ func (fs *fakeSession) ReceiveFrom(p peer.ID, ks []cid.Cid, wantBlocks []cid.Cid
 type fakeSesPeerManager struct {
 }
 
-func (*fakeSesPeerManager) ReceiveFrom(peer.ID, []cid.Cid, []cid.Cid) bool { return true }
-func (*fakeSesPeerManager) Peers() *peer.Set                               { return nil }
-func (*fakeSesPeerManager) FindMorePeers(context.Context, cid.Cid)         {}
-func (*fakeSesPeerManager) RecordPeerRequests([]peer.ID, []cid.Cid)        {}
-func (*fakeSesPeerManager) RecordPeerResponse(peer.ID, []cid.Cid)          {}
-func (*fakeSesPeerManager) RecordCancels(c []cid.Cid)                      {}
+func (*fakeSesPeerManager) Peers() []peer.ID        { return nil }
+func (*fakeSesPeerManager) PeersDiscovered() bool   { return false }
+func (*fakeSesPeerManager) Shutdown()               {}
+func (*fakeSesPeerManager) AddPeer(peer.ID) bool    { return false }
+func (*fakeSesPeerManager) RemovePeer(peer.ID) bool { return false }
+func (*fakeSesPeerManager) HasPeers() bool          { return false }
 
 type fakePeerManager struct {
+	cancels []cid.Cid
 }
 
 func (*fakePeerManager) RegisterSession(peer.ID, bspm.Session) bool               { return true }
 func (*fakePeerManager) UnregisterSession(uint64)                                 {}
 func (*fakePeerManager) SendWants(context.Context, peer.ID, []cid.Cid, []cid.Cid) {}
+func (*fakePeerManager) BroadcastWantHaves(context.Context, []cid.Cid)            {}
+func (fpm *fakePeerManager) SendCancels(ctx context.Context, cancels []cid.Cid) {
+	fpm.cancels = append(fpm.cancels, cancels...)
+}
 
 func sessionFactory(ctx context.Context,
 	id uint64,
@@ -101,25 +106,29 @@ func TestReceiveFrom(t *testing.T) {
 	sim.RecordSessionInterest(firstSession.ID(), []cid.Cid{block.Cid()})
 	sim.RecordSessionInterest(thirdSession.ID(), []cid.Cid{block.Cid()})
 
-	sm.ReceiveFrom(p, []cid.Cid{block.Cid()}, []cid.Cid{}, []cid.Cid{})
+	sm.ReceiveFrom(ctx, p, []cid.Cid{block.Cid()}, []cid.Cid{}, []cid.Cid{})
 	if len(firstSession.ks) == 0 ||
 		len(secondSession.ks) > 0 ||
 		len(thirdSession.ks) == 0 {
 		t.Fatal("should have received blocks but didn't")
 	}
 
-	sm.ReceiveFrom(p, []cid.Cid{}, []cid.Cid{block.Cid()}, []cid.Cid{})
+	sm.ReceiveFrom(ctx, p, []cid.Cid{}, []cid.Cid{block.Cid()}, []cid.Cid{})
 	if len(firstSession.wantBlocks) == 0 ||
 		len(secondSession.wantBlocks) > 0 ||
 		len(thirdSession.wantBlocks) == 0 {
 		t.Fatal("should have received want-blocks but didn't")
 	}
 
-	sm.ReceiveFrom(p, []cid.Cid{}, []cid.Cid{}, []cid.Cid{block.Cid()})
+	sm.ReceiveFrom(ctx, p, []cid.Cid{}, []cid.Cid{}, []cid.Cid{block.Cid()})
 	if len(firstSession.wantHaves) == 0 ||
 		len(secondSession.wantHaves) > 0 ||
 		len(thirdSession.wantHaves) == 0 {
 		t.Fatal("should have received want-haves but didn't")
+	}
+
+	if len(pm.cancels) != 1 {
+		t.Fatal("should have sent cancel for received blocks")
 	}
 }
 
@@ -150,7 +159,7 @@ func TestReceiveBlocksWhenManagerContextCancelled(t *testing.T) {
 	// wait for sessions to get removed
 	time.Sleep(10 * time.Millisecond)
 
-	sm.ReceiveFrom(p, []cid.Cid{block.Cid()}, []cid.Cid{}, []cid.Cid{})
+	sm.ReceiveFrom(ctx, p, []cid.Cid{block.Cid()}, []cid.Cid{}, []cid.Cid{})
 	if len(firstSession.ks) > 0 ||
 		len(secondSession.ks) > 0 ||
 		len(thirdSession.ks) > 0 {
@@ -186,7 +195,7 @@ func TestReceiveBlocksWhenSessionContextCancelled(t *testing.T) {
 	// wait for sessions to get removed
 	time.Sleep(10 * time.Millisecond)
 
-	sm.ReceiveFrom(p, []cid.Cid{block.Cid()}, []cid.Cid{}, []cid.Cid{})
+	sm.ReceiveFrom(ctx, p, []cid.Cid{block.Cid()}, []cid.Cid{}, []cid.Cid{})
 	if len(firstSession.ks) == 0 ||
 		len(secondSession.ks) > 0 ||
 		len(thirdSession.ks) == 0 {

@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	lu "github.com/ipfs/go-bitswap/internal/logutil"
 	"github.com/ipfs/go-bitswap/internal/testutil"
 	message "github.com/ipfs/go-bitswap/message"
 	pb "github.com/ipfs/go-bitswap/message/pb"
@@ -92,9 +91,13 @@ type engineSet struct {
 }
 
 func newTestEngine(ctx context.Context, idStr string) engineSet {
+	return newTestEngineWithSampling(ctx, idStr, shortTerm, nil)
+}
+
+func newTestEngineWithSampling(ctx context.Context, idStr string, peerSampleInterval time.Duration, sampleCh chan struct{}) engineSet {
 	fpt := &fakePeerTagger{}
 	bs := blockstore.NewBlockstore(dssync.MutexWrap(ds.NewMapDatastore()))
-	e := newEngine(ctx, bs, fpt, "localhost", 0)
+	e := newEngine(ctx, bs, fpt, "localhost", 0, peerSampleInterval, sampleCh)
 	e.StartWorkers(ctx, process.WithTeardown(func() error { return nil }))
 	return engineSet{
 		Peer: peer.ID(idStr),
@@ -181,7 +184,7 @@ func peerIsPartner(p peer.ID, e *Engine) bool {
 func TestOutboxClosedWhenEngineClosed(t *testing.T) {
 	ctx := context.Background()
 	t.SkipNow() // TODO implement *Engine.Close
-	e := newEngine(ctx, blockstore.NewBlockstore(dssync.MutexWrap(ds.NewMapDatastore())), &fakePeerTagger{}, "localhost", 0)
+	e := newEngine(ctx, blockstore.NewBlockstore(dssync.MutexWrap(ds.NewMapDatastore())), &fakePeerTagger{}, "localhost", 0, shortTerm, nil)
 	e.StartWorkers(ctx, process.WithTeardown(func() error { return nil }))
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -509,7 +512,7 @@ func TestPartnerWantHaveWantBlockNonActive(t *testing.T) {
 		testCases = onlyTestCases
 	}
 
-	e := newEngine(context.Background(), bs, &fakePeerTagger{}, "localhost", 0)
+	e := newEngine(context.Background(), bs, &fakePeerTagger{}, "localhost", 0, shortTerm, nil)
 	e.StartWorkers(context.Background(), process.WithTeardown(func() error { return nil }))
 	for i, testCase := range testCases {
 		t.Logf("Test case %d:", i)
@@ -665,7 +668,7 @@ func TestPartnerWantHaveWantBlockActive(t *testing.T) {
 		testCases = onlyTestCases
 	}
 
-	e := newEngine(context.Background(), bs, &fakePeerTagger{}, "localhost", 0)
+	e := newEngine(context.Background(), bs, &fakePeerTagger{}, "localhost", 0, shortTerm, nil)
 	e.StartWorkers(context.Background(), process.WithTeardown(func() error { return nil }))
 
 	var next envChan
@@ -776,12 +779,12 @@ func formatBlocksDiff(blks []blocks.Block, expBlks []string) string {
 	var out bytes.Buffer
 	out.WriteString(fmt.Sprintf("Blocks (%d):\n", len(blks)))
 	for _, b := range blks {
-		out.WriteString(fmt.Sprintf("  %s: %s\n", lu.C(b.Cid()), b.RawData()))
+		out.WriteString(fmt.Sprintf("  %s: %s\n", b.Cid(), b.RawData()))
 	}
 	out.WriteString(fmt.Sprintf("Expected (%d):\n", len(expBlks)))
 	for _, k := range expBlks {
 		expected := blocks.NewBlock([]byte(k))
-		out.WriteString(fmt.Sprintf("  %s: %s\n", lu.C(expected.Cid()), k))
+		out.WriteString(fmt.Sprintf("  %s: %s\n", expected.Cid(), k))
 	}
 	return out.String()
 }
@@ -794,16 +797,16 @@ func formatPresencesDiff(presences []message.BlockPresence, expHaves []string, e
 		if p.Type == pb.Message_DontHave {
 			t = "DONT_HAVE"
 		}
-		out.WriteString(fmt.Sprintf("  %s - %s\n", lu.C(p.Cid), t))
+		out.WriteString(fmt.Sprintf("  %s - %s\n", p.Cid, t))
 	}
 	out.WriteString(fmt.Sprintf("Expected (%d):\n", len(expHaves)+len(expDontHaves)))
 	for _, k := range expHaves {
 		expected := blocks.NewBlock([]byte(k))
-		out.WriteString(fmt.Sprintf("  %s: %s - HAVE\n", lu.C(expected.Cid()), k))
+		out.WriteString(fmt.Sprintf("  %s: %s - HAVE\n", expected.Cid(), k))
 	}
 	for _, k := range expDontHaves {
 		expected := blocks.NewBlock([]byte(k))
-		out.WriteString(fmt.Sprintf("  %s: %s - DONT_HAVE\n", lu.C(expected.Cid()), k))
+		out.WriteString(fmt.Sprintf("  %s: %s - DONT_HAVE\n", expected.Cid(), k))
 	}
 	return out.String()
 }
@@ -850,7 +853,7 @@ func TestPartnerWantsThenCancels(t *testing.T) {
 	ctx := context.Background()
 	for i := 0; i < numRounds; i++ {
 		expected := make([][]string, 0, len(testcases))
-		e := newEngine(ctx, bs, &fakePeerTagger{}, "localhost", 0)
+		e := newEngine(ctx, bs, &fakePeerTagger{}, "localhost", 0, shortTerm, nil)
 		e.StartWorkers(ctx, process.WithTeardown(func() error { return nil }))
 		for _, testcase := range testcases {
 			set := testcase[0]
@@ -875,7 +878,7 @@ func TestSendReceivedBlocksToPeersThatWantThem(t *testing.T) {
 	partner := libp2ptest.RandPeerIDFatal(t)
 	otherPeer := libp2ptest.RandPeerIDFatal(t)
 
-	e := newEngine(context.Background(), bs, &fakePeerTagger{}, "localhost", 0)
+	e := newEngine(context.Background(), bs, &fakePeerTagger{}, "localhost", 0, shortTerm, nil)
 	e.StartWorkers(context.Background(), process.WithTeardown(func() error { return nil }))
 
 	blks := testutil.GenerateBlocksOfSize(4, 8*1024)
@@ -919,7 +922,7 @@ func TestSendDontHave(t *testing.T) {
 	partner := libp2ptest.RandPeerIDFatal(t)
 	otherPeer := libp2ptest.RandPeerIDFatal(t)
 
-	e := newEngine(context.Background(), bs, &fakePeerTagger{}, "localhost", 0)
+	e := newEngine(context.Background(), bs, &fakePeerTagger{}, "localhost", 0, shortTerm, nil)
 	e.StartWorkers(context.Background(), process.WithTeardown(func() error { return nil }))
 
 	blks := testutil.GenerateBlocksOfSize(4, 8*1024)
@@ -932,7 +935,7 @@ func TestSendDontHave(t *testing.T) {
 
 	// Nothing in blockstore, should get DONT_HAVE for entries that wanted it
 	var next envChan
-	next, env := getNextEnvelope(e, next, 5*time.Millisecond)
+	next, env := getNextEnvelope(e, next, 10*time.Millisecond)
 	if env == nil {
 		t.Fatal("expected envelope")
 	}
@@ -962,7 +965,7 @@ func TestSendDontHave(t *testing.T) {
 	e.ReceiveFrom(otherPeer, blks, []cid.Cid{})
 
 	// Envelope should contain 2 HAVEs / 2 blocks
-	_, env = getNextEnvelope(e, next, 5*time.Millisecond)
+	_, env = getNextEnvelope(e, next, 10*time.Millisecond)
 	if env == nil {
 		t.Fatal("expected envelope")
 	}
@@ -1007,13 +1010,13 @@ func TestTaggingPeers(t *testing.T) {
 }
 
 func TestTaggingUseful(t *testing.T) {
-	oldShortTerm := shortTerm
-	shortTerm = 2 * time.Millisecond
-	defer func() { shortTerm = oldShortTerm }()
+	peerSampleInterval := 1 * time.Millisecond
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	me := newTestEngine(ctx, "engine")
+
+	sampleCh := make(chan struct{})
+	me := newTestEngineWithSampling(ctx, "engine", peerSampleInterval, sampleCh)
 	friend := peer.ID("friend")
 
 	block := blocks.NewBlock([]byte("foobar"))
@@ -1024,22 +1027,38 @@ func TestTaggingUseful(t *testing.T) {
 		if me.PeerTagger.count(me.Engine.tagUseful) != 0 {
 			t.Fatal("Peers should be untagged but weren't")
 		}
+
 		me.Engine.MessageSent(friend, msg)
-		time.Sleep(shortTerm * 2)
+
+		for j := 0; j < 3; j++ {
+			<-sampleCh
+		}
+
 		if me.PeerTagger.count(me.Engine.tagUseful) != 1 {
 			t.Fatal("Peers should be tagged but weren't")
 		}
-		time.Sleep(shortTerm * 8)
+
+		for j := 0; j < longTermRatio; j++ {
+			<-sampleCh
+		}
 	}
 
 	if me.PeerTagger.count(me.Engine.tagUseful) == 0 {
 		t.Fatal("peers should still be tagged due to long-term usefulness")
 	}
-	time.Sleep(shortTerm * 2)
+
+	for j := 0; j < longTermRatio; j++ {
+		<-sampleCh
+	}
+
 	if me.PeerTagger.count(me.Engine.tagUseful) == 0 {
 		t.Fatal("peers should still be tagged due to long-term usefulness")
 	}
-	time.Sleep(shortTerm * 20)
+
+	for j := 0; j < longTermRatio; j++ {
+		<-sampleCh
+	}
+
 	if me.PeerTagger.count(me.Engine.tagUseful) != 0 {
 		t.Fatal("peers should finally be untagged")
 	}
@@ -1049,14 +1068,14 @@ func partnerWantBlocks(e *Engine, keys []string, partner peer.ID) {
 	add := message.New(false)
 	for i, letter := range keys {
 		block := blocks.NewBlock([]byte(letter))
-		add.AddEntry(block.Cid(), len(keys)-i, pb.Message_Wantlist_Block, true)
+		add.AddEntry(block.Cid(), int32(len(keys)-i), pb.Message_Wantlist_Block, true)
 	}
 	e.MessageReceived(context.Background(), partner, add)
 }
 
 func partnerWantBlocksHaves(e *Engine, keys []string, wantHaves []string, sendDontHave bool, partner peer.ID) {
 	add := message.New(false)
-	priority := len(wantHaves) + len(keys)
+	priority := int32(len(wantHaves) + len(keys))
 	for _, letter := range wantHaves {
 		block := blocks.NewBlock([]byte(letter))
 		add.AddEntry(block.Cid(), priority, pb.Message_Wantlist_Have, sendDontHave)

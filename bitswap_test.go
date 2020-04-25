@@ -11,8 +11,8 @@ import (
 	bitswap "github.com/ipfs/go-bitswap"
 	decision "github.com/ipfs/go-bitswap/internal/decision"
 	bssession "github.com/ipfs/go-bitswap/internal/session"
-	testinstance "github.com/ipfs/go-bitswap/internal/testinstance"
-	tn "github.com/ipfs/go-bitswap/internal/testnet"
+	testinstance "github.com/ipfs/go-bitswap/testinstance"
+	tn "github.com/ipfs/go-bitswap/testnet"
 	"github.com/ipfs/go-bitswap/message"
 	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
@@ -245,7 +245,7 @@ func TestLargeSwarm(t *testing.T) {
 	if detectrace.WithRace() {
 		// when running with the race detector, 500 instances launches
 		// well over 8k goroutines. This hits a race detector limit.
-		numInstances = 50
+		numInstances = 20
 	} else if travis.IsRunning() {
 		numInstances = 200
 	} else {

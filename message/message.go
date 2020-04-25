@@ -2,7 +2,7 @@ package message
 
 import (
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"io"
 
 	pb "github.com/ipfs/go-bitswap/message/pb"
@@ -13,6 +13,7 @@ import (
 	pool "github.com/libp2p/go-buffer-pool"
 	msgio "github.com/libp2p/go-msgio"
 
+	u "github.com/ipfs/go-ipfs-util"
 	"github.com/libp2p/go-libp2p-core/network"
 )
 
@@ -37,11 +38,15 @@ type BitSwapMessage interface {
 	PendingBytes() int32
 
 	// AddEntry adds an entry to the Wantlist.
-	AddEntry(key cid.Cid, priority int, wantType pb.Message_Wantlist_WantType, sendDontHave bool) int
+	AddEntry(key cid.Cid, priority int32, wantType pb.Message_Wantlist_WantType, sendDontHave bool) int
 
 	// Cancel adds a CANCEL for the given CID to the message
 	// Returns the size of the CANCEL entry in the protobuf
 	Cancel(key cid.Cid) int
+
+	// Remove removes any entries for the given CID. Useful when the want
+	// status for the CID changes when preparing a message.
+	Remove(key cid.Cid)
 
 	// Empty indicates whether the message has any information
 	Empty() bool
@@ -65,6 +70,12 @@ type BitSwapMessage interface {
 	Exportable
 
 	Loggable() map[string]interface{}
+
+	// Reset the values in the message back to defaults, so it can be reused
+	Reset(bool)
+
+	// Clone the message fields
+	Clone() BitSwapMessage
 }
 
 // Exportable is an interface for structures than can be
@@ -85,6 +96,51 @@ type BlockPresence struct {
 	Type pb.Message_BlockPresenceType
 }
 
+// Entry is a wantlist entry in a Bitswap message, with flags indicating
+// - whether message is a cancel
+// - whether requester wants a DONT_HAVE message
+// - whether requester wants a HAVE message (instead of the block)
+type Entry struct {
+	wantlist.Entry
+	Cancel       bool
+	SendDontHave bool
+}
+
+// Get the size of the entry on the wire
+func (e *Entry) Size() int {
+	epb := e.ToPB()
+	return epb.Size()
+}
+
+// Get the entry in protobuf form
+func (e *Entry) ToPB() pb.Message_Wantlist_Entry {
+	return pb.Message_Wantlist_Entry{
+		Block:        pb.Cid{Cid: e.Cid},
+		Priority:     int32(e.Priority),
+		Cancel:       e.Cancel,
+		WantType:     e.WantType,
+		SendDontHave: e.SendDontHave,
+	}
+}
+
+var MaxEntrySize = maxEntrySize()
+
+func maxEntrySize() int {
+	var maxInt32 int32 = (1 << 31) - 1
+
+	c := cid.NewCidV0(u.Hash([]byte("cid")))
+	e := Entry{
+		Entry: wantlist.Entry{
+			Cid:      c,
+			Priority: maxInt32,
+			WantType: pb.Message_Wantlist_Have,
+		},
+		SendDontHave: true, // true takes up more space than false
+		Cancel:       true,
+	}
+	return e.Size()
+}
+
 type impl struct {
 	full           bool
 	wantlist       map[cid.Cid]*Entry
@@ -100,31 +156,53 @@ func New(full bool) BitSwapMessage {
 
 func newMsg(full bool) *impl {
 	return &impl{
+		full:           full,
+		wantlist:       make(map[cid.Cid]*Entry),
 		blocks:         make(map[cid.Cid]blocks.Block),
 		blockPresences: make(map[cid.Cid]pb.Message_BlockPresenceType),
-		wantlist:       make(map[cid.Cid]*Entry),
-		full:           full,
 	}
 }
 
-// Entry is a wantlist entry in a Bitswap message, with flags indicating
-// - whether message is a cancel
-// - whether requester wants a DONT_HAVE message
-// - whether requester wants a HAVE message (instead of the block)
-type Entry struct {
-	wantlist.Entry
-	Cancel       bool
-	SendDontHave bool
+// Clone the message fields
+func (m *impl) Clone() BitSwapMessage {
+	msg := newMsg(m.full)
+	for k := range m.wantlist {
+		msg.wantlist[k] = m.wantlist[k]
+	}
+	for k := range m.blocks {
+		msg.blocks[k] = m.blocks[k]
+	}
+	for k := range m.blockPresences {
+		msg.blockPresences[k] = m.blockPresences[k]
+	}
+	msg.pendingBytes = m.pendingBytes
+	return msg
 }
+
+// Reset the values in the message back to defaults, so it can be reused
+func (m *impl) Reset(full bool) {
+	m.full = full
+	for k := range m.wantlist {
+		delete(m.wantlist, k)
+	}
+	for k := range m.blocks {
+		delete(m.blocks, k)
+	}
+	for k := range m.blockPresences {
+		delete(m.blockPresences, k)
+	}
+	m.pendingBytes = 0
+}
+
+var errCidMissing = errors.New("missing cid")
 
 func newMessageFromProto(pbm pb.Message) (BitSwapMessage, error) {
 	m := newMsg(pbm.Wantlist.Full)
 	for _, e := range pbm.Wantlist.Entries {
-		c, err := cid.Cast([]byte(e.Block))
-		if err != nil {
-			return nil, fmt.Errorf("incorrectly formatted cid in wantlist: %s", err)
+		if !e.Block.Cid.Defined() {
+			return nil, errCidMissing
 		}
-		m.addEntry(c, int(e.Priority), e.Cancel, e.WantType, e.SendDontHave)
+		m.addEntry(e.Block.Cid, e.Priority, e.Cancel, e.WantType, e.SendDontHave)
 	}
 
 	// deprecated
@@ -155,13 +233,10 @@ func newMessageFromProto(pbm pb.Message) (BitSwapMessage, error) {
 	}
 
 	for _, bi := range pbm.GetBlockPresences() {
-		c, err := cid.Cast(bi.GetCid())
-		if err != nil {
-			return nil, err
+		if !bi.Cid.Cid.Defined() {
+			return nil, errCidMissing
 		}
-
-		t := bi.GetType()
-		m.AddBlockPresence(c, t)
+		m.AddBlockPresence(bi.Cid.Cid, bi.Type)
 	}
 
 	m.pendingBytes = pbm.PendingBytes
@@ -227,15 +302,19 @@ func (m *impl) SetPendingBytes(pendingBytes int32) {
 	m.pendingBytes = pendingBytes
 }
 
+func (m *impl) Remove(k cid.Cid) {
+	delete(m.wantlist, k)
+}
+
 func (m *impl) Cancel(k cid.Cid) int {
 	return m.addEntry(k, 0, true, pb.Message_Wantlist_Block, false)
 }
 
-func (m *impl) AddEntry(k cid.Cid, priority int, wantType pb.Message_Wantlist_WantType, sendDontHave bool) int {
+func (m *impl) AddEntry(k cid.Cid, priority int32, wantType pb.Message_Wantlist_WantType, sendDontHave bool) int {
 	return m.addEntry(k, priority, false, wantType, sendDontHave)
 }
 
-func (m *impl) addEntry(c cid.Cid, priority int, cancel bool, wantType pb.Message_Wantlist_WantType, sendDontHave bool) int {
+func (m *impl) addEntry(c cid.Cid, priority int32, cancel bool, wantType pb.Message_Wantlist_WantType, sendDontHave bool) int {
 	e, exists := m.wantlist[c]
 	if exists {
 		// Only change priority if want is of the same type
@@ -269,8 +348,7 @@ func (m *impl) addEntry(c cid.Cid, priority int, cancel bool, wantType pb.Messag
 	}
 	m.wantlist[c] = e
 
-	aspb := entryToPB(e)
-	return aspb.Size()
+	return e.Size()
 }
 
 func (m *impl) AddBlock(b blocks.Block) {
@@ -302,8 +380,7 @@ func (m *impl) Size() int {
 		size += BlockPresenceSize(c)
 	}
 	for _, e := range m.wantlist {
-		epb := entryToPB(e)
-		size += epb.Size()
+		size += e.Size()
 	}
 
 	return size
@@ -311,7 +388,7 @@ func (m *impl) Size() int {
 
 func BlockPresenceSize(c cid.Cid) int {
 	return (&pb.Message_BlockPresence{
-		Cid:  c.Bytes(),
+		Cid:  pb.Cid{Cid: c},
 		Type: pb.Message_Have,
 	}).Size()
 }
@@ -339,21 +416,11 @@ func FromMsgReader(r msgio.Reader) (BitSwapMessage, error) {
 	return newMessageFromProto(pb)
 }
 
-func entryToPB(e *Entry) pb.Message_Wantlist_Entry {
-	return pb.Message_Wantlist_Entry{
-		Block:        e.Cid.Bytes(),
-		Priority:     int32(e.Priority),
-		Cancel:       e.Cancel,
-		WantType:     e.WantType,
-		SendDontHave: e.SendDontHave,
-	}
-}
-
 func (m *impl) ToProtoV0() *pb.Message {
 	pbm := new(pb.Message)
 	pbm.Wantlist.Entries = make([]pb.Message_Wantlist_Entry, 0, len(m.wantlist))
 	for _, e := range m.wantlist {
-		pbm.Wantlist.Entries = append(pbm.Wantlist.Entries, entryToPB(e))
+		pbm.Wantlist.Entries = append(pbm.Wantlist.Entries, e.ToPB())
 	}
 	pbm.Wantlist.Full = m.full
 
@@ -369,7 +436,7 @@ func (m *impl) ToProtoV1() *pb.Message {
 	pbm := new(pb.Message)
 	pbm.Wantlist.Entries = make([]pb.Message_Wantlist_Entry, 0, len(m.wantlist))
 	for _, e := range m.wantlist {
-		pbm.Wantlist.Entries = append(pbm.Wantlist.Entries, entryToPB(e))
+		pbm.Wantlist.Entries = append(pbm.Wantlist.Entries, e.ToPB())
 	}
 	pbm.Wantlist.Full = m.full
 
@@ -385,7 +452,7 @@ func (m *impl) ToProtoV1() *pb.Message {
 	pbm.BlockPresences = make([]pb.Message_BlockPresence, 0, len(m.blockPresences))
 	for c, t := range m.blockPresences {
 		pbm.BlockPresences = append(pbm.BlockPresences, pb.Message_BlockPresence{
-			Cid:  c.Bytes(),
+			Cid:  pb.Cid{Cid: c},
 			Type: t,
 		})
 	}

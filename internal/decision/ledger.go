@@ -43,10 +43,6 @@ type ledger struct {
 	// wantList is a (bounded, small) set of keys that Partner desires.
 	wantList *wl.Wantlist
 
-	// ref is the reference count for this ledger, its used to ensure we
-	// don't drop the reference to this ledger in multi-connection scenarios
-	ref int
-
 	lk sync.RWMutex
 }
 
@@ -91,7 +87,7 @@ func (l *ledger) ReceivedBytes(n int) {
 	l.Accounting.BytesRecv += uint64(n)
 }
 
-func (l *ledger) Wants(k cid.Cid, priority int, wantType pb.Message_Wantlist_WantType) {
+func (l *ledger) Wants(k cid.Cid, priority int32, wantType pb.Message_Wantlist_WantType) {
 	log.Debugf("peer %s wants %s", l.Partner, k)
 	l.wantList.Add(k, priority, wantType)
 }

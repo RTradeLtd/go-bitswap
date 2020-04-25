@@ -9,20 +9,24 @@ import (
 	bsmsg "github.com/ipfs/go-bitswap/message"
 	pb "github.com/ipfs/go-bitswap/message/pb"
 	bsnet "github.com/ipfs/go-bitswap/network"
+	"github.com/ipfs/go-bitswap/wantlist"
 	bswl "github.com/ipfs/go-bitswap/wantlist"
 	cid "github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log"
 	peer "github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
+	"go.uber.org/zap"
 )
 
 var log = logging.Logger("bitswap")
+var sflog = log.Desugar()
 
 const (
 	defaultRebroadcastInterval = 30 * time.Second
 	// maxRetries is the number of times to attempt to send a message before
 	// giving up
-	maxRetries = 10
+	maxRetries  = 3
+	sendTimeout = 30 * time.Second
 	// maxMessageSize is the maximum message size in bytes
 	maxMessageSize = 1024 * 1024 * 2
 	// sendErrorBackoff is the time to wait before retrying to connect after
@@ -43,14 +47,16 @@ const (
 // sender.
 type MessageNetwork interface {
 	ConnectTo(context.Context, peer.ID) error
-	NewMessageSender(context.Context, peer.ID) (bsnet.MessageSender, error)
+	NewMessageSender(context.Context, peer.ID, *bsnet.MessageSenderOpts) (bsnet.MessageSender, error)
 	Latency(peer.ID) time.Duration
 	Ping(context.Context, peer.ID) ping.Result
+	Self() peer.ID
 }
 
 // MessageQueue implements queue of want messages to send to peers.
 type MessageQueue struct {
 	ctx              context.Context
+	shutdown         func()
 	p                peer.ID
 	network          MessageNetwork
 	dhTimeoutMgr     DontHaveTimeoutManager
@@ -58,55 +64,66 @@ type MessageQueue struct {
 	sendErrorBackoff time.Duration
 
 	outgoingWork chan time.Time
-	done         chan struct{}
 
 	// Take lock whenever any of these variables are modified
 	wllock    sync.Mutex
 	bcstWants recallWantlist
 	peerWants recallWantlist
 	cancels   *cid.Set
-	priority  int
+	priority  int32
 
 	// Dont touch any of these variables outside of run loop
 	sender                bsnet.MessageSender
 	rebroadcastIntervalLk sync.RWMutex
 	rebroadcastInterval   time.Duration
 	rebroadcastTimer      *time.Timer
+	// For performance reasons we just clear out the fields of the message
+	// instead of creating a new one every time.
+	msg bsmsg.BitSwapMessage
 }
 
-// recallWantlist keeps a list of pending wants, and a list of all wants that
-// have ever been requested
+// recallWantlist keeps a list of pending wants and a list of sent wants
 type recallWantlist struct {
-	// The list of all wants that have been requested, including wants that
-	// have been sent and wants that have not yet been sent
-	allWants *bswl.Wantlist
 	// The list of wants that have not yet been sent
 	pending *bswl.Wantlist
+	// The list of wants that have been sent
+	sent *bswl.Wantlist
 }
 
 func newRecallWantList() recallWantlist {
 	return recallWantlist{
-		allWants: bswl.New(),
-		pending:  bswl.New(),
+		pending: bswl.New(),
+		sent:    bswl.New(),
 	}
 }
 
-// Add want to both the pending list and the list of all wants
-func (r *recallWantlist) Add(c cid.Cid, priority int, wtype pb.Message_Wantlist_WantType) {
-	r.allWants.Add(c, priority, wtype)
+// Add want to the pending list
+func (r *recallWantlist) Add(c cid.Cid, priority int32, wtype pb.Message_Wantlist_WantType) {
 	r.pending.Add(c, priority, wtype)
 }
 
-// Remove wants from both the pending list and the list of all wants
+// Remove wants from both the pending list and the list of sent wants
 func (r *recallWantlist) Remove(c cid.Cid) {
-	r.allWants.Remove(c)
+	r.sent.Remove(c)
 	r.pending.Remove(c)
 }
 
-// Remove wants by type from both the pending list and the list of all wants
+// Remove wants by type from both the pending list and the list of sent wants
 func (r *recallWantlist) RemoveType(c cid.Cid, wtype pb.Message_Wantlist_WantType) {
-	r.allWants.RemoveType(c, wtype)
+	r.sent.RemoveType(c, wtype)
 	r.pending.RemoveType(c, wtype)
+}
+
+// MarkSent moves the want from the pending to the sent list
+//
+// Returns true if the want was marked as sent. Returns false if the want wasn't
+// pending.
+func (r *recallWantlist) MarkSent(e wantlist.Entry) bool {
+	if !r.pending.RemoveType(e.Cid, e.WantType) {
+		return false
+	}
+	r.sent.Add(e.Cid, e.Priority, e.WantType)
+	return true
 }
 
 type peerConn struct {
@@ -148,9 +165,10 @@ type DontHaveTimeoutManager interface {
 // New creates a new MessageQueue.
 func New(ctx context.Context, p peer.ID, network MessageNetwork, onDontHaveTimeout OnDontHaveTimeout) *MessageQueue {
 	onTimeout := func(ks []cid.Cid) {
+		log.Infow("Bitswap: timeout waiting for blocks", "cids", ks, "peer", p)
 		onDontHaveTimeout(p, ks)
 	}
-	dhTimeoutMgr := newDontHaveTimeoutMgr(ctx, newPeerConnection(p, network), onTimeout)
+	dhTimeoutMgr := newDontHaveTimeoutMgr(newPeerConnection(p, network), onTimeout)
 	return newMessageQueue(ctx, p, network, maxMessageSize, sendErrorBackoff, dhTimeoutMgr)
 }
 
@@ -158,8 +176,10 @@ func New(ctx context.Context, p peer.ID, network MessageNetwork, onDontHaveTimeo
 func newMessageQueue(ctx context.Context, p peer.ID, network MessageNetwork,
 	maxMsgSize int, sendErrorBackoff time.Duration, dhTimeoutMgr DontHaveTimeoutManager) *MessageQueue {
 
+	ctx, cancel := context.WithCancel(ctx)
 	mq := &MessageQueue{
 		ctx:                 ctx,
+		shutdown:            cancel,
 		p:                   p,
 		network:             network,
 		dhTimeoutMgr:        dhTimeoutMgr,
@@ -168,10 +188,12 @@ func newMessageQueue(ctx context.Context, p peer.ID, network MessageNetwork,
 		peerWants:           newRecallWantList(),
 		cancels:             cid.NewSet(),
 		outgoingWork:        make(chan time.Time, 1),
-		done:                make(chan struct{}),
 		rebroadcastInterval: defaultRebroadcastInterval,
 		sendErrorBackoff:    sendErrorBackoff,
 		priority:            maxPriority,
+		// For performance reasons we just clear out the fields of the message
+		// after using it, instead of creating a new one every time.
+		msg: bsmsg.New(false),
 	}
 
 	return mq
@@ -239,17 +261,34 @@ func (mq *MessageQueue) AddCancels(cancelKs []cid.Cid) {
 	mq.dhTimeoutMgr.CancelPending(cancelKs)
 
 	mq.wllock.Lock()
-	defer mq.wllock.Unlock()
+
+	workReady := false
 
 	// Remove keys from broadcast and peer wants, and add to cancels
 	for _, c := range cancelKs {
+		// Check if a want for the key was sent
+		_, wasSentBcst := mq.bcstWants.sent.Contains(c)
+		_, wasSentPeer := mq.peerWants.sent.Contains(c)
+
+		// Remove the want from tracking wantlists
 		mq.bcstWants.Remove(c)
 		mq.peerWants.Remove(c)
-		mq.cancels.Add(c)
+
+		// Only send a cancel if a want was sent
+		if wasSentBcst || wasSentPeer {
+			mq.cancels.Add(c)
+			workReady = true
+		}
 	}
 
+	mq.wllock.Unlock()
+
+	// Unlock first to be nice to the scheduler.
+
 	// Schedule a message send
-	mq.signalWorkReady()
+	if workReady {
+		mq.signalWorkReady()
+	}
 }
 
 // SetRebroadcastInterval sets a new interval on which to rebroadcast the full wantlist
@@ -272,12 +311,17 @@ func (mq *MessageQueue) Startup() {
 
 // Shutdown stops the processing of messages for a message queue.
 func (mq *MessageQueue) Shutdown() {
-	close(mq.done)
+	mq.shutdown()
 }
 
 func (mq *MessageQueue) onShutdown() {
 	// Shut down the DONT_HAVE timeout manager
 	mq.dhTimeoutMgr.Shutdown()
+
+	// Reset the streamMessageSender
+	if mq.sender != nil {
+		_ = mq.sender.Reset()
+	}
 }
 
 func (mq *MessageQueue) runQueue() {
@@ -292,7 +336,7 @@ func (mq *MessageQueue) runQueue() {
 	}
 
 	var workScheduled time.Time
-	for {
+	for mq.ctx.Err() == nil {
 		select {
 		case <-mq.rebroadcastTimer.C:
 			mq.rebroadcastWantlist()
@@ -323,15 +367,7 @@ func (mq *MessageQueue) runQueue() {
 			// in sendMessageDebounce. Send immediately.
 			workScheduled = time.Time{}
 			mq.sendIfReady()
-		case <-mq.done:
-			if mq.sender != nil {
-				mq.sender.Close()
-			}
-			return
 		case <-mq.ctx.Done():
-			if mq.sender != nil {
-				_ = mq.sender.Reset()
-			}
 			return
 		}
 	}
@@ -356,13 +392,13 @@ func (mq *MessageQueue) transferRebroadcastWants() bool {
 	defer mq.wllock.Unlock()
 
 	// Check if there are any wants to rebroadcast
-	if mq.bcstWants.allWants.Len() == 0 && mq.peerWants.allWants.Len() == 0 {
+	if mq.bcstWants.sent.Len() == 0 && mq.peerWants.sent.Len() == 0 {
 		return false
 	}
 
-	// Copy all wants into pending wants lists
-	mq.bcstWants.pending.Absorb(mq.bcstWants.allWants)
-	mq.peerWants.pending.Absorb(mq.peerWants.allWants)
+	// Copy sent wants into pending wants lists
+	mq.bcstWants.pending.Absorb(mq.bcstWants.sent)
+	mq.peerWants.pending.Absorb(mq.peerWants.sent)
 
 	return true
 }
@@ -381,69 +417,67 @@ func (mq *MessageQueue) sendIfReady() {
 }
 
 func (mq *MessageQueue) sendMessage() {
-	err := mq.initializeSender()
+	sender, err := mq.initializeSender()
 	if err != nil {
-		log.Infof("cant open message sender to peer %s: %s", mq.p, err)
-		// TODO: cant connect, what now?
-		// TODO: should we stop using this connection and clear the want list
-		// to avoid using up memory?
+		// If we fail to initialize the sender, the networking layer will
+		// emit a Disconnect event and the MessageQueue will get cleaned up
+		log.Infof("Could not open message sender to peer %s: %s", mq.p, err)
+		mq.Shutdown()
 		return
 	}
 
 	// Make sure the DONT_HAVE timeout manager has started
-	if !mq.sender.SupportsHave() {
-		// Note: Start is idempotent
-		mq.dhTimeoutMgr.Start()
-	}
+	// Note: Start is idempotent
+	mq.dhTimeoutMgr.Start()
 
 	// Convert want lists to a Bitswap Message
-	message, onSent := mq.extractOutgoingMessage(mq.sender.SupportsHave())
-	if message == nil || message.Empty() {
+	message := mq.extractOutgoingMessage(mq.sender.SupportsHave())
+
+	// After processing the message, clear out its fields to save memory
+	defer mq.msg.Reset(false)
+
+	if message.Empty() {
 		return
 	}
 
-	// mq.logOutgoingMessage(message)
+	wantlist := message.Wantlist()
+	mq.logOutgoingMessage(wantlist)
 
-	// Try to send this message repeatedly
-	for i := 0; i < maxRetries; i++ {
-		if mq.attemptSendAndRecovery(message) {
-			// We were able to send successfully.
-			onSent()
+	if err := sender.SendMsg(mq.ctx, message); err != nil {
+		// If the message couldn't be sent, the networking layer will
+		// emit a Disconnect event and the MessageQueue will get cleaned up
+		log.Infof("Could not send message to peer %s: %s", mq.p, err)
+		mq.Shutdown()
+		return
+	}
 
-			mq.simulateDontHaveWithTimeout(message)
+	// Set a timer to wait for responses
+	mq.simulateDontHaveWithTimeout(wantlist)
 
-			// If the message was too big and only a subset of wants could be
-			// sent, schedule sending the rest of the wants in the next
-			// iteration of the event loop.
-			if mq.hasPendingWork() {
-				mq.signalWorkReady()
-			}
-
-			return
-		}
+	// If the message was too big and only a subset of wants could be
+	// sent, schedule sending the rest of the wants in the next
+	// iteration of the event loop.
+	if mq.hasPendingWork() {
+		mq.signalWorkReady()
 	}
 }
 
-// If the peer is running an older version of Bitswap that doesn't support the
-// DONT_HAVE response, watch for timeouts on any want-blocks we sent the peer,
-// and if there is a timeout simulate a DONT_HAVE response.
-func (mq *MessageQueue) simulateDontHaveWithTimeout(msg bsmsg.BitSwapMessage) {
-	// If the peer supports DONT_HAVE responses, we don't need to simulate
-	if mq.sender.SupportsHave() {
-		return
-	}
+// If want-block times out, simulate a DONT_HAVE reponse.
+// This is necessary when making requests to peers running an older version of
+// Bitswap that doesn't support the DONT_HAVE response, and is also useful to
+// mitigate getting blocked by a peer that takes a long time to respond.
+func (mq *MessageQueue) simulateDontHaveWithTimeout(wantlist []bsmsg.Entry) {
+	// Get the CID of each want-block that expects a DONT_HAVE response
+	wants := make([]cid.Cid, 0, len(wantlist))
 
 	mq.wllock.Lock()
 
-	// Get the CID of each want-block that expects a DONT_HAVE response
-	wantlist := msg.Wantlist()
-	wants := make([]cid.Cid, 0, len(wantlist))
 	for _, entry := range wantlist {
 		if entry.WantType == pb.Message_Wantlist_Block && entry.SendDontHave {
 			// Unlikely, but just in case check that the block hasn't been
 			// received in the interim
 			c := entry.Cid
-			if _, ok := mq.peerWants.allWants.Contains(c); ok {
+			if _, ok := mq.peerWants.sent.Contains(c); ok {
 				wants = append(wants, c)
 			}
 		}
@@ -455,29 +489,56 @@ func (mq *MessageQueue) simulateDontHaveWithTimeout(msg bsmsg.BitSwapMessage) {
 	mq.dhTimeoutMgr.AddPending(wants)
 }
 
-// func (mq *MessageQueue) logOutgoingMessage(msg bsmsg.BitSwapMessage) {
-// 	entries := msg.Wantlist()
-// 	for _, e := range entries {
-// 		if e.Cancel {
-// 			if e.WantType == pb.Message_Wantlist_Have {
-// 				log.Debugf("send %s->%s: cancel-have %s\n", lu.P(mq.network.Self()), lu.P(mq.p), lu.C(e.Cid))
-// 			} else {
-// 				log.Debugf("send %s->%s: cancel-block %s\n", lu.P(mq.network.Self()), lu.P(mq.p), lu.C(e.Cid))
-// 			}
-// 		} else {
-// 			if e.WantType == pb.Message_Wantlist_Have {
-// 				log.Debugf("send %s->%s: want-have %s\n", lu.P(mq.network.Self()), lu.P(mq.p), lu.C(e.Cid))
-// 			} else {
-// 				log.Debugf("send %s->%s: want-block %s\n", lu.P(mq.network.Self()), lu.P(mq.p), lu.C(e.Cid))
-// 			}
-// 		}
-// 	}
-// }
+func (mq *MessageQueue) logOutgoingMessage(wantlist []bsmsg.Entry) {
+	// Save some CPU cycles and allocations if log level is higher than debug
+	if ce := sflog.Check(zap.DebugLevel, "sent message"); ce == nil {
+		return
+	}
 
+	self := mq.network.Self()
+	for _, e := range wantlist {
+		if e.Cancel {
+			if e.WantType == pb.Message_Wantlist_Have {
+				log.Debugw("sent message",
+					"type", "CANCEL_WANT_HAVE",
+					"cid", e.Cid,
+					"local", self,
+					"to", mq.p,
+				)
+			} else {
+				log.Debugw("sent message",
+					"type", "CANCEL_WANT_BLOCK",
+					"cid", e.Cid,
+					"local", self,
+					"to", mq.p,
+				)
+			}
+		} else {
+			if e.WantType == pb.Message_Wantlist_Have {
+				log.Debugw("sent message",
+					"type", "WANT_HAVE",
+					"cid", e.Cid,
+					"local", self,
+					"to", mq.p,
+				)
+			} else {
+				log.Debugw("sent message",
+					"type", "WANT_BLOCK",
+					"cid", e.Cid,
+					"local", self,
+					"to", mq.p,
+				)
+			}
+		}
+	}
+}
+
+// Whether there is work to be processed
 func (mq *MessageQueue) hasPendingWork() bool {
 	return mq.pendingWorkCount() > 0
 }
 
+// The amount of work that is waiting to be processed
 func (mq *MessageQueue) pendingWorkCount() int {
 	mq.wllock.Lock()
 	defer mq.wllock.Unlock()
@@ -485,22 +546,79 @@ func (mq *MessageQueue) pendingWorkCount() int {
 	return mq.bcstWants.pending.Len() + mq.peerWants.pending.Len() + mq.cancels.Len()
 }
 
-func (mq *MessageQueue) extractOutgoingMessage(supportsHave bool) (bsmsg.BitSwapMessage, func()) {
-	// Create a new message
-	msg := bsmsg.New(false)
-
+// Convert the lists of wants into a Bitswap message
+func (mq *MessageQueue) extractOutgoingMessage(supportsHave bool) bsmsg.BitSwapMessage {
+	// Get broadcast and regular wantlist entries.
 	mq.wllock.Lock()
-	defer mq.wllock.Unlock()
+	peerEntries := mq.peerWants.pending.Entries()
+	bcstEntries := mq.bcstWants.pending.Entries()
+	cancels := mq.cancels.Keys()
+	if !supportsHave {
+		filteredPeerEntries := peerEntries[:0]
+		// If the remote peer doesn't support HAVE / DONT_HAVE messages,
+		// don't send want-haves (only send want-blocks)
+		//
+		// Doing this here under the lock makes everything else in this
+		// function simpler.
+		//
+		// TODO: We should _try_ to avoid recording these in the first
+		// place if possible.
+		for _, e := range peerEntries {
+			if e.WantType == pb.Message_Wantlist_Have {
+				mq.peerWants.RemoveType(e.Cid, pb.Message_Wantlist_Have)
+			} else {
+				filteredPeerEntries = append(filteredPeerEntries, e)
+			}
+		}
+		peerEntries = filteredPeerEntries
+	}
+	mq.wllock.Unlock()
 
-	// Get broadcast and regular wantlist entries
-	bcstEntries := mq.bcstWants.pending.SortedEntries()
-	peerEntries := mq.peerWants.pending.SortedEntries()
+	// We prioritize cancels, then regular wants, then broadcast wants.
 
-	// Size of the message so far
-	msgSize := 0
+	var (
+		msgSize         = 0 // size of message so far
+		sentCancels     = 0 // number of cancels in message
+		sentPeerEntries = 0 // number of peer entries in message
+		sentBcstEntries = 0 // number of broadcast entries in message
+	)
+
+	// Add each cancel to the message
+	for _, c := range cancels {
+		msgSize += mq.msg.Cancel(c)
+		sentCancels++
+
+		if msgSize >= mq.maxMessageSize {
+			goto FINISH
+		}
+	}
+
+	// Next, add the wants. If we have too many entries to fit into a single
+	// message, sort by priority and include the high priority ones first.
+	// However, avoid sorting till we really need to as this code is a
+	// called frequently.
+
+	// Add each regular want-have / want-block to the message.
+	if msgSize+(len(peerEntries)*bsmsg.MaxEntrySize) > mq.maxMessageSize {
+		bswl.SortEntries(peerEntries)
+	}
+
+	for _, e := range peerEntries {
+		msgSize += mq.msg.AddEntry(e.Cid, e.Priority, e.WantType, true)
+		sentPeerEntries++
+
+		if msgSize >= mq.maxMessageSize {
+			goto FINISH
+		}
+	}
+
+	// Add each broadcast want-have to the message.
+	if msgSize+(len(bcstEntries)*bsmsg.MaxEntrySize) > mq.maxMessageSize {
+		bswl.SortEntries(bcstEntries)
+	}
 
 	// Add each broadcast want-have to the message
-	for i := 0; i < len(bcstEntries) && msgSize < mq.maxMessageSize; i++ {
+	for _, e := range bcstEntries {
 		// Broadcast wants are sent as want-have
 		wantType := pb.Message_Wantlist_Have
 
@@ -510,112 +628,57 @@ func (mq *MessageQueue) extractOutgoingMessage(supportsHave bool) (bsmsg.BitSwap
 			wantType = pb.Message_Wantlist_Block
 		}
 
-		e := bcstEntries[i]
-		msgSize += msg.AddEntry(e.Cid, e.Priority, wantType, false)
+		msgSize += mq.msg.AddEntry(e.Cid, e.Priority, wantType, false)
+		sentBcstEntries++
+
+		if msgSize >= mq.maxMessageSize {
+			goto FINISH
+		}
 	}
 
-	// Add each regular want-have / want-block to the message
-	for i := 0; i < len(peerEntries) && msgSize < mq.maxMessageSize; i++ {
-		e := peerEntries[i]
-		// If the remote peer doesn't support HAVE / DONT_HAVE messages,
-		// don't send want-haves (only send want-blocks)
-		if !supportsHave && e.WantType == pb.Message_Wantlist_Have {
-			mq.peerWants.RemoveType(e.Cid, pb.Message_Wantlist_Have)
+FINISH:
+
+	// Finally, re-take the lock, mark sent and remove any entries from our
+	// message that we've decided to cancel at the last minute.
+	mq.wllock.Lock()
+	for _, e := range peerEntries[:sentPeerEntries] {
+		if !mq.peerWants.MarkSent(e) {
+			// It changed.
+			mq.msg.Remove(e.Cid)
+		}
+	}
+
+	for _, e := range bcstEntries[:sentBcstEntries] {
+		if !mq.bcstWants.MarkSent(e) {
+			mq.msg.Remove(e.Cid)
+		}
+	}
+
+	for _, c := range cancels[:sentCancels] {
+		if !mq.cancels.Has(c) {
+			mq.msg.Remove(c)
 		} else {
-			msgSize += msg.AddEntry(e.Cid, e.Priority, e.WantType, true)
+			mq.cancels.Remove(c)
 		}
 	}
+	mq.wllock.Unlock()
 
-	// Add each cancel to the message
-	cancels := mq.cancels.Keys()
-	for i := 0; i < len(cancels) && msgSize < mq.maxMessageSize; i++ {
-		c := cancels[i]
+	return mq.msg
+}
 
-		msgSize += msg.Cancel(c)
-
-		// Clear the cancel - we make a best effort to let peers know about
-		// cancels but won't save them to resend if there's a failure.
-		mq.cancels.Remove(c)
-	}
-
-	// Called when the message has been successfully sent.
-	// Remove the sent keys from the broadcast and regular wantlists.
-	onSent := func() {
-		mq.wllock.Lock()
-		defer mq.wllock.Unlock()
-
-		for _, e := range msg.Wantlist() {
-			mq.bcstWants.pending.Remove(e.Cid)
-			mq.peerWants.pending.RemoveType(e.Cid, e.WantType)
+func (mq *MessageQueue) initializeSender() (bsnet.MessageSender, error) {
+	if mq.sender == nil {
+		opts := &bsnet.MessageSenderOpts{
+			MaxRetries:       maxRetries,
+			SendTimeout:      sendTimeout,
+			SendErrorBackoff: sendErrorBackoff,
 		}
-	}
-
-	return msg, onSent
-}
-
-func (mq *MessageQueue) initializeSender() error {
-	if mq.sender != nil {
-		return nil
-	}
-	nsender, err := openSender(mq.ctx, mq.network, mq.p)
-	if err != nil {
-		return err
-	}
-	mq.sender = nsender
-	return nil
-}
-
-func (mq *MessageQueue) attemptSendAndRecovery(message bsmsg.BitSwapMessage) bool {
-	err := mq.sender.SendMsg(mq.ctx, message)
-	if err == nil {
-		return true
-	}
-
-	log.Infof("bitswap send error: %s", err)
-	_ = mq.sender.Reset()
-	mq.sender = nil
-
-	select {
-	case <-mq.done:
-		return true
-	case <-mq.ctx.Done():
-		return true
-	case <-time.After(mq.sendErrorBackoff):
-		// wait 100ms in case disconnect notifications are still propagating
-		log.Warning("SendMsg errored but neither 'done' nor context.Done() were set")
-	}
-
-	err = mq.initializeSender()
-	if err != nil {
-		log.Infof("couldnt open sender again after SendMsg(%s) failed: %s", mq.p, err)
-		return true
-	}
-
-	// TODO: Is this the same instance for the remote peer?
-	// If its not, we should resend our entire wantlist to them
-	/*
-		if mq.sender.InstanceID() != mq.lastSeenInstanceID {
-			wlm = mq.getFullWantlistMessage()
+		nsender, err := mq.network.NewMessageSender(mq.ctx, mq.p, opts)
+		if err != nil {
+			return nil, err
 		}
-	*/
-	return false
-}
 
-func openSender(ctx context.Context, network MessageNetwork, p peer.ID) (bsnet.MessageSender, error) {
-	// allow ten minutes for connections this includes looking them up in the
-	// dht dialing them, and handshaking
-	conctx, cancel := context.WithTimeout(ctx, time.Minute*10)
-	defer cancel()
-
-	err := network.ConnectTo(conctx, p)
-	if err != nil {
-		return nil, err
+		mq.sender = nsender
 	}
-
-	nsender, err := network.NewMessageSender(ctx, p)
-	if err != nil {
-		return nil, err
-	}
-
-	return nsender, nil
+	return mq.sender, nil
 }
